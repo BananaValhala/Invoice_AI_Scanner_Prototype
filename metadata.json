@@ -1,0 +1,5 @@
+{
+  "name": "InvoiceAI Proto",
+  "description": "A high-precision prototype for scanning multi-language invoices and mapping them to a product database using Gemini 3 Flash.",
+  "requestFramePermissions": []
+}
