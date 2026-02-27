@@ -12,7 +12,6 @@ export interface InvoiceItem {
   raw_price: number;
   raw_quantity: number;
   matched_product_id: string | null;
-  confidence_score: number;
 }
 
 export interface ProcessedInvoice {
@@ -21,11 +20,11 @@ export interface ProcessedInvoice {
   status: 'pending' | 'processing' | 'completed' | 'error';
   items: InvoiceItem[];
   timestamp: string;
-  rawImageBase64?: string;
+  rawImageBase64?: string | string[];
   error?: string;
 }
 
-export type AIProvider = 'gemini' | 'openai' | 'anthropic';
+export type AIProvider = 'gemini' | 'openai';
 
 export interface AIConfig {
   provider: AIProvider;

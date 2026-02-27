@@ -41,7 +41,6 @@ export const processInvoiceImage = async (
        - Match the invoice item against either name, or semantically if it's a translation.
        - If the exact name isn't there, look for the closest logical match (e.g., "Tomato A" invoice vs "Tomato" db).
     4. If a match is found, include the 'matched_product_id'. If not, set it to null.
-    5. Provide a confidence score (0-1) for the match.
 
     REQUIREMENTS:
     - Raw extraction must be 100% accurate to the image text.
@@ -75,10 +74,9 @@ export const processInvoiceImage = async (
               raw_name: { type: Type.STRING, description: "The product name exactly as it appears on the invoice" },
               raw_quantity: { type: Type.NUMBER, description: "The numeric quantity" },
               raw_price: { type: Type.NUMBER, description: "The total price for this line item" },
-              matched_product_id: { type: Type.STRING, description: "The ID from the Product Database, or null if no match", nullable: true },
-              confidence_score: { type: Type.NUMBER, description: "Confidence in the database match (0.0 to 1.0)" }
+              matched_product_id: { type: Type.STRING, description: "The ID from the Product Database, or null if no match", nullable: true }
             },
-            required: ["raw_name", "raw_quantity", "raw_price", "confidence_score"]
+            required: ["raw_name", "raw_quantity", "raw_price"]
           }
         }
       }

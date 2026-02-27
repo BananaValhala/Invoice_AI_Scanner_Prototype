@@ -34,8 +34,8 @@ export const Settings: React.FC<SettingsProps> = ({ config, onConfigChange, isOp
           <div className="space-y-4">
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1">Model Provider</label>
-              <div className="grid grid-cols-3 gap-2">
-                {(['gemini', 'openai', 'anthropic'] as AIProvider[]).map((p) => (
+              <div className="grid grid-cols-2 gap-2">
+                {(['gemini', 'openai'] as AIProvider[]).map((p) => (
                   <button
                     key={p}
                     onClick={() => handleChange('provider', p)}

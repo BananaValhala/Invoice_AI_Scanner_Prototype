@@ -1,6 +1,6 @@
 import React, { useState, useCallback } from 'react';
-import { Product, ProcessedInvoice, AIConfig } from './types';
-import { parseCSV, fileToBase64, downloadJSON } from './services/utils';
+import { Product, ProcessedInvoice, AIConfig, InvoiceItem } from './types';
+import { parseCSV, fileToBase64, preprocessImage, downloadJSON } from './services/utils';
 import { processInvoice, generateEmbeddingsForDatabase } from './services/aiService';
 import { Dropzone } from './components/Dropzone';
 import { DatabaseViewer } from './components/DatabaseViewer';
@@ -31,7 +31,50 @@ export default function App() {
     const file = files[0];
     const text = await file.text();
     const parsedData = parseCSV(text);
-    setDatabase(parsedData);
+    
+    // Smart Merge: Preserve existing embeddings if IDs/Names match
+    // This prevents re-indexing the entire database when just adding new items
+    if (database.length > 0) {
+        // Create maps for fast lookup
+        // Note: If multiple items share the same ID/Name, the last one wins in the map.
+        const existingMap = new Map();
+        const nameMap = new Map();
+        
+        database.forEach(p => {
+            if (p.id) existingMap.set(p.id, p.embedding);
+            if (p.name) nameMap.set(p.name, p.embedding);
+        });
+
+        let preservedCount = 0;
+        
+        const mergedData = parsedData.map(newItem => {
+            // Priority 1: Match by ID (most reliable)
+            let existingEmbedding = newItem.id ? existingMap.get(newItem.id) : undefined;
+            
+            // Priority 2: Match by Name (fallback)
+            if (!existingEmbedding && newItem.name) {
+                existingEmbedding = nameMap.get(newItem.name);
+            }
+            
+            if (existingEmbedding && existingEmbedding.length > 0) {
+                preservedCount++;
+                return { ...newItem, embedding: existingEmbedding };
+            }
+            
+            // If no embedding found, return the new item as-is (it will be indexed later)
+            return newItem;
+        });
+        
+        setDatabase(mergedData);
+        
+        const newCount = mergedData.length - preservedCount;
+        
+        if (preservedCount > 0) {
+            alert(`Database Updated:\n- Total Items: ${mergedData.length}\n- Preserved Embeddings: ${preservedCount}\n- New Items to Index: ${newCount}`);
+        }
+    } else {
+        setDatabase(parsedData);
+    }
   };
 
   // Handle Invoice Images Upload
@@ -39,14 +82,17 @@ export default function App() {
     const newInvoices: ProcessedInvoice[] = [];
     
     for (const file of files) {
-      const base64 = await fileToBase64(file);
+      // Use preprocessImage to handle long receipts by slicing them
+      const chunks = await preprocessImage(file);
+      
       newInvoices.push({
         id: Math.random().toString(36).substr(2, 9),
         fileName: file.name,
         status: 'pending',
         items: [],
         timestamp: new Date().toLocaleString(),
-        rawImageBase64: base64
+        // Store chunks array if multiple, or single string if one
+        rawImageBase64: chunks.length === 1 ? chunks[0] : chunks
       });
     }
     
@@ -57,6 +103,61 @@ export default function App() {
     setInvoices(prev => prev.filter(inv => inv.id !== id));
   };
 
+  const handleRetryInvoice = async (invoice: ProcessedInvoice, incorrectItems: InvoiceItem[]) => {
+    if (database.length === 0) {
+      alert("Please upload a product database CSV first.");
+      return;
+    }
+
+    const hasApiKey = aiConfig.apiKey || 
+      (aiConfig.provider === 'gemini' && process.env.GEMINI_API_KEY) ||
+      (aiConfig.provider === 'openai' && process.env.OPENAI_API_KEY);
+
+    if (!hasApiKey) {
+      alert(`Please enter an API Key for ${aiConfig.provider} in Settings.`);
+      setIsSettingsOpen(true);
+      return;
+    }
+
+    // Set status to processing
+    setInvoices(prev => prev.map(inv => 
+      inv.id === invoice.id ? { ...inv, status: 'processing', error: undefined } : inv
+    ));
+
+    try {
+      if (!invoice.rawImageBase64) throw new Error("No image data");
+      
+      // Pass feedback to processInvoice
+      const extractedItems = await processInvoice(
+        invoice.rawImageBase64, 
+        database, 
+        aiConfig,
+        { incorrectItems }
+      );
+      
+      setInvoices(prev => prev.map(inv => 
+        inv.id === invoice.id ? { 
+          ...inv, 
+          status: 'completed', 
+          items: extractedItems 
+        } : inv
+      ));
+    } catch (e: any) {
+      console.error(e);
+      setInvoices(prev => prev.map(inv => 
+        inv.id === invoice.id ? { ...inv, status: 'error', error: e.message } : inv
+      ));
+    }
+  };
+
+  const [processingStats, setProcessingStats] = useState<{
+    startTime: number | null;
+    completedCount: number;
+    totalCount: number;
+  }>({ startTime: null, completedCount: 0, totalCount: 0 });
+
+  // ... (existing code)
+
   // Process Invoices
   const handleProcessInvoices = async () => {
     if (database.length === 0) {
@@ -64,7 +165,11 @@ export default function App() {
       return;
     }
     
-    if (aiConfig.provider !== 'gemini' && !aiConfig.apiKey) {
+    const hasApiKey = aiConfig.apiKey || 
+      (aiConfig.provider === 'gemini' && process.env.GEMINI_API_KEY) ||
+      (aiConfig.provider === 'openai' && process.env.OPENAI_API_KEY);
+
+    if (!hasApiKey) {
       alert(`Please enter an API Key for ${aiConfig.provider} in Settings.`);
       setIsSettingsOpen(true);
       return;
@@ -74,7 +179,8 @@ export default function App() {
 
     // 1. Check/Index Database
     let currentDb = database;
-    const needsIndexing = database.length > 0 && !database[0].embedding;
+    // Fix: Check if ANY item is missing an embedding, not just the first one.
+    const needsIndexing = database.some(p => !p.embedding || p.embedding.length === 0);
     
     if (needsIndexing) {
       setIndexingStatus("Initializing database indexing...");
@@ -96,33 +202,50 @@ export default function App() {
     
     // 2. Process Invoices
     const pendingInvoices = invoices.filter(inv => inv.status === 'pending');
+    setProcessingStats({
+      startTime: Date.now(),
+      completedCount: 0,
+      totalCount: pendingInvoices.length
+    });
     
-    for (const invoice of pendingInvoices) {
-      setInvoices(prev => prev.map(inv => 
-        inv.id === invoice.id ? { ...inv, status: 'processing' } : inv
-      ));
+    // Parallelize invoice processing for speed (batch of 5)
+    const BATCH_SIZE = 5;
+    for (let i = 0; i < pendingInvoices.length; i += BATCH_SIZE) {
+        const batch = pendingInvoices.slice(i, i + BATCH_SIZE);
+        
+        await Promise.all(batch.map(async (invoice) => {
+             setInvoices(prev => prev.map(inv => 
+                inv.id === invoice.id ? { ...inv, status: 'processing' } : inv
+              ));
 
-      try {
-        if (!invoice.rawImageBase64) throw new Error("No image data");
-        
-        const extractedItems = await processInvoice(invoice.rawImageBase64, currentDb, aiConfig);
-        
-        setInvoices(prev => prev.map(inv => 
-          inv.id === invoice.id ? { 
-            ...inv, 
-            status: 'completed', 
-            items: extractedItems 
-          } : inv
-        ));
-      } catch (e: any) {
-        console.error(e);
-        setInvoices(prev => prev.map(inv => 
-          inv.id === invoice.id ? { ...inv, status: 'error', error: e.message } : inv
-        ));
-      }
+              try {
+                if (!invoice.rawImageBase64) throw new Error("No image data");
+                
+                const extractedItems = await processInvoice(invoice.rawImageBase64, currentDb, aiConfig);
+                
+                setInvoices(prev => prev.map(inv => 
+                  inv.id === invoice.id ? { 
+                    ...inv, 
+                    status: 'completed', 
+                    items: extractedItems 
+                  } : inv
+                ));
+              } catch (e: any) {
+                console.error(e);
+                setInvoices(prev => prev.map(inv => 
+                  inv.id === invoice.id ? { ...inv, status: 'error', error: e.message } : inv
+                ));
+              } finally {
+                  setProcessingStats(prev => ({
+                      ...prev,
+                      completedCount: prev.completedCount + 1
+                  }));
+              }
+        }));
     }
     
     setIsProcessing(false);
+    setProcessingStats({ startTime: null, completedCount: 0, totalCount: 0 });
   };
 
   const handleExport = () => {
@@ -213,6 +336,35 @@ export default function App() {
                </div>
             </div>
           </div>
+        )}
+
+        {/* Processing Speed Indicator */}
+        {isProcessing && !indexingStatus && processingStats.startTime && (
+            <div className="mb-6 p-4 bg-emerald-50 border border-emerald-100 rounded-xl flex items-center gap-3">
+                <Zap size={20} className="text-emerald-600 animate-pulse shrink-0" />
+                <div className="flex-1">
+                    <div className="flex justify-between items-center mb-1">
+                        <p className="text-emerald-800 font-medium text-sm">
+                            Processing Invoices ({processingStats.completedCount}/{processingStats.totalCount})
+                        </p>
+                        <span className="text-xs text-emerald-600 font-mono">
+                            {(() => {
+                                const elapsed = (Date.now() - processingStats.startTime) / 1000;
+                                const speed = processingStats.completedCount > 0 ? processingStats.completedCount / elapsed : 0;
+                                const remaining = processingStats.totalCount - processingStats.completedCount;
+                                const eta = speed > 0 ? Math.ceil(remaining / speed) : 0;
+                                return `${speed.toFixed(1)} inv/s | ETA: ${eta}s`;
+                            })()}
+                        </span>
+                    </div>
+                    <div className="w-full bg-emerald-200 rounded-full h-1.5">
+                        <div 
+                            className="bg-emerald-600 h-1.5 rounded-full transition-all duration-300"
+                            style={{ width: `${(processingStats.completedCount / processingStats.totalCount) * 100}%` }}
+                        ></div>
+                    </div>
+                </div>
+            </div>
         )}
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 h-full">
@@ -312,14 +464,11 @@ export default function App() {
                   .filter(inv => inv.status !== 'pending')
                   .map(inv => (
                     <div key={inv.id} className="relative group">
-                       <ProcessedResults invoice={inv} database={database} />
-                       {inv.status === 'error' && inv.error && (
-                         <div className="absolute inset-0 flex items-center justify-center bg-white/80 rounded-xl">
-                            <div className="text-red-600 text-sm font-medium bg-red-50 p-4 rounded-lg border border-red-200">
-                               Error: {inv.error}
-                            </div>
-                         </div>
-                       )}
+                       <ProcessedResults 
+                          invoice={inv} 
+                          database={database} 
+                          onRetry={handleRetryInvoice}
+                       />
                     </div>
                 ))
               )}

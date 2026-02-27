@@ -11,6 +11,13 @@
         background-color: #f8fafc;
       }
     </style>
+    <script>
+      // Polyfills for legacy/Node-assuming libraries (like PaddleOCR)
+      window.global = window;
+      window.module = {};
+      window.Module = {};
+      window.process = { env: { NODE_ENV: 'development' } };
+    </script>
   </head>
   <body>
     <div id="root"></div>

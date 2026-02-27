@@ -4,9 +4,12 @@ import { findNearestNeighbors } from "./utils";
 
 // --- Providers Setup ---
 const getEffectiveKey = (config: AIConfig) => {
-  return (config.provider === 'gemini' && !config.apiKey) 
-    ? process.env.API_KEY 
-    : config.apiKey;
+  if (config.apiKey) return config.apiKey;
+  
+  if (config.provider === 'gemini') return process.env.API_KEY;
+  if (config.provider === 'openai') return process.env.OPENAI_API_KEY;
+  
+  return '';
 };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -94,43 +97,61 @@ export const generateEmbeddingsForDatabase = async (
 
   const updatedProducts = [...products];
   
-  // Serial processing to strictly respect rate limits
-  for (let i = 0; i < updatedProducts.length; i++) {
-    const product = updatedProducts[i];
-    // Skip if already has embedding
-    if (product.embedding && product.embedding.length > 0) continue;
-
-    // Sanitize input
-    const textToEmbed = `${product.name} ${product.localName} ${product.category || ''}`.trim();
-    if (!textToEmbed) continue;
+  // For OpenAI, we can parallelize more aggressively.
+  // For Gemini, we still need to be careful with rate limits on the free tier.
+  const BATCH_SIZE = config.provider === 'openai' ? 20 : 1; 
+  
+  for (let i = 0; i < updatedProducts.length; i += BATCH_SIZE) {
+    const batch = updatedProducts.slice(i, i + BATCH_SIZE);
     
-    try {
-      const embedding = await retryOperation(async () => {
-        if (config.provider === 'openai') {
-          return await embedTextOpenAI(textToEmbed, apiKey);
-        } else {
-          // Default to Gemini
-          const embedKey = config.provider === 'anthropic' ? process.env.API_KEY : apiKey;
-          if (embedKey) {
-             return await embedTextGemini(textToEmbed, embedKey);
-          }
-          return undefined;
+    // Optimization: Check if ALL items in this batch already have embeddings
+    const allEmbedded = batch.every(p => p.embedding && p.embedding.length > 0);
+    
+    if (allEmbedded) {
+        // Skip API calls and delay entirely for this batch
+        if (onProgress) {
+            // Update progress immediately but don't sleep
+            onProgress(Math.min(i + BATCH_SIZE, updatedProducts.length), updatedProducts.length);
         }
-      });
-      
-      product.embedding = embedding;
-
-    } catch (e) {
-      console.error(`Failed to embed ${product.id}`, e);
-      // Continue processing other items even if one fails
+        continue; 
     }
+
+    await Promise.all(batch.map(async (product) => {
+        // Skip if already has embedding
+        if (product.embedding && product.embedding.length > 0) return;
+
+        // Sanitize input
+        const textToEmbed = `${product.name} ${product.localName} ${product.category || ''}`.trim();
+        if (!textToEmbed) return;
+        
+        try {
+          const embedding = await retryOperation(async () => {
+            if (config.provider === 'openai') {
+              return await embedTextOpenAI(textToEmbed, apiKey);
+            } else {
+              // Default to Gemini
+              if (apiKey) {
+                 return await embedTextGemini(textToEmbed, apiKey);
+              }
+              return undefined;
+            }
+          });
+          
+          product.embedding = embedding;
+    
+        } catch (e) {
+          console.error(`Failed to embed ${product.id}`, e);
+          // Continue processing other items even if one fails
+        }
+    }));
 
     if (onProgress) {
-      onProgress(i + 1, updatedProducts.length);
+      onProgress(Math.min(i + BATCH_SIZE, updatedProducts.length), updatedProducts.length);
     }
     
-    // Base delay between requests
-    await sleep(200);
+    // Minimal delay for OpenAI, longer for Gemini
+    const delay = config.provider === 'openai' ? 10 : 200;
+    await sleep(delay);
   }
 
   return updatedProducts;
@@ -138,86 +159,164 @@ export const generateEmbeddingsForDatabase = async (
 
 // --- 2. Extraction (Phase 1) ---
 
-const extractRawItems = async (imageBase64: string, config: AIConfig): Promise<Partial<InvoiceItem>[]> => {
+const extractRawItems = async (
+  imageBase64: string | string[], 
+  config: AIConfig,
+  database: Product[],
+  feedback?: { incorrectItems: InvoiceItem[] }
+): Promise<Partial<InvoiceItem>[]> => {
   const apiKey = getEffectiveKey(config);
   if (!apiKey) throw new Error(`API Key required for ${config.provider}`);
 
-  const prompt = `
-    Extract all line items from this invoice image.
-    Return a JSON object with a key "items" containing an array of:
-    - raw_name (text as seen)
-    - raw_quantity (number)
-    - raw_price (total number)
+  // Normalize input to array
+  const imageChunks = Array.isArray(imageBase64) ? imageBase64 : [imageBase64];
+  let allItems: Partial<InvoiceItem>[] = [];
+
+  // Create a context string from the database (limited to avoid token limits if DB is huge)
+  // We'll take a sample or just list names if it's reasonable. 
+  // For a prototype, we can list up to ~500 names or use a more sophisticated retrieval if needed.
+  // Here we'll just take the first 200 names as a "vocabulary hint" to keep it simple but effective.
+  const vocabularyHint = database
+    .slice(0, 200)
+    .map(p => p.name)
+    .join(", ");
+
+  let feedbackPrompt = "";
+  if (feedback && feedback.incorrectItems.length > 0) {
+    feedbackPrompt = `
+    PREVIOUS ATTEMPT FEEDBACK:
+    The user marked the following extracted items as INCORRECT in a previous run. 
+    Please pay extra attention to correctly extracting these items (or similar ones) from the image.
     
-    Do not attempt to normalize or map product names yet. Just extract raw text.
+    Incorrect Items:
+    ${JSON.stringify(feedback.incorrectItems.map(i => ({ name: i.raw_name, price: i.raw_price })), null, 2)}
+    `;
+  }
+
+  const prompt = `
+    Analyze this invoice image and extract ALL line items into a MARKDOWN TABLE, only extract text ignoring formating, do not translate.
+    
+    CONTEXT AWARENESS (RAG):
+    Here is a list of known product names in our database. Use this as a "vocabulary list" to help you decipher blurry or abbreviated text. 
+    If you see something that looks like one of these, prefer the known spelling.
+    
+    KNOWN PRODUCTS (Vocabulary):
+    [${vocabularyHint}...]
+    
+    STRATEGY: SPATIAL ALIGNMENT
+    1. **Identify Rows**: Look for the numeric columns (Quantity, Price, Amount).
+    2. **Extract**: For each row with numbers, extract the corresponding Description text.
+    
+    CRITICAL - MULTI-LINE DESCRIPTIONS:
+    - If a product description spans multiple lines (e.g. Name on line 1, Region on line 2), you MUST combine them into the "Description" column for that single row.
+    - Do NOT create a new row for the second line of text if it doesn't have its own price/quantity.
+    
+    ${feedbackPrompt}
+
+    OUTPUT FORMAT:
+    Return ONLY a Markdown table with the following columns:
+    | Description | Quantity | Price |
+    
+    - Description: The full product name/description (verbatim).
+    - Quantity: The numeric quantity (number only).
+    - Price: The total amount (number only).
+    
+    Example:
+    | Product A Region X | 2 | 1000 |
+    | Product B | 1 | 500 |
   `;
 
-  return retryOperation(async () => {
-    if (config.provider === 'openai') {
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model: "gpt-4o", 
-          messages: [
-            { role: "system", content: "You are a precise OCR agent. Return JSON object." },
-            { role: "user", content: [{ type: "text", text: prompt }, { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }] }
-          ],
-          response_format: { type: "json_object" }
-        })
-      });
-      const data = await response.json();
-      if (data.error) throw new Error(data.error.message);
-      const content = safeJSONParse(data.choices[0].message.content, { items: [] });
-      return content.items || [];
-      
-    } else if (config.provider === 'anthropic') {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json", "anthropic-dangerously-allow-browser": "true" },
-          body: JSON.stringify({
-            model: "claude-3-5-sonnet-20241022", max_tokens: 4096,
-            messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/jpeg", data: imageBase64 } }, { type: "text", text: prompt + " Return JSON." }] }]
-          })
-      });
-      const data = await response.json();
-      if (data.error) throw new Error(data.error.message);
-      const text = data.content[0].text;
-      const parsed = safeJSONParse(text, { items: [] });
-      return Array.isArray(parsed) ? parsed : (parsed.items || []);
+  // Process chunks sequentially
+  for (let i = 0; i < imageChunks.length; i++) {
+    const chunkBase64 = imageChunks[i];
+    
+    const chunkPrompt = imageChunks.length > 1 
+      ? `${prompt}\n\nNOTE: This is part ${i + 1} of ${imageChunks.length} of a long invoice. Extract items visible in this section.`
+      : prompt;
 
-    } else {
-      // Gemini
-      const ai = new GoogleGenAI({ apiKey });
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: {
-          parts: [{ inlineData: { mimeType: 'image/jpeg', data: imageBase64 } }, { text: prompt }]
-        },
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-               items: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      raw_name: { type: Type.STRING },
-                      raw_quantity: { type: Type.NUMBER },
-                      raw_price: { type: Type.NUMBER }
-                    }
-                  }
-               }
+    const chunkItems = await retryOperation(async () => {
+      let textResponse = "";
+      
+      if (config.provider === 'openai') {
+        // Use Gemini Vision as OCR for OpenAI provider (Hybrid Approach)
+        // This leverages Gemini's superior free vision capabilities while keeping OpenAI for RAG/Mapping
+        const geminiApiKey = process.env.API_KEY; // Always use the system env key for Gemini
+        
+        if (geminiApiKey) {
+           const ai = new GoogleGenAI({ apiKey: geminiApiKey });
+           const response = await ai.models.generateContent({
+             model: 'gemini-3-flash-preview',
+             contents: {
+               parts: [{ inlineData: { mimeType: 'image/jpeg', data: chunkBase64 } }, { text: chunkPrompt }]
+             }
+           });
+           textResponse = response.text || "";
+        } else {
+           // Fallback to OpenAI Vision (GPT-4o-mini) if no Gemini key available (unlikely in this env)
+           const response = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+            body: JSON.stringify({
+              model: "gpt-4o-mini", 
+              messages: [
+                { role: "system", content: "You are an expert OCR agent. You output strictly Markdown tables." },
+                { role: "user", content: [{ type: "text", text: chunkPrompt }, { type: "image_url", image_url: { url: `data:image/jpeg;base64,${chunkBase64}`, detail: "high" } }] }
+              ]
+            })
+          });
+          const data = await response.json();
+          if (data.error) throw new Error(data.error.message);
+          textResponse = data.choices[0].message.content;
+        }
+        
+      } else {
+        // Gemini
+        const ai = new GoogleGenAI({ apiKey });
+        const response = await ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: {
+            parts: [{ inlineData: { mimeType: 'image/jpeg', data: chunkBase64 } }, { text: chunkPrompt }]
+          }
+        });
+        textResponse = response.text || "";
+      }
+
+      // Parse Markdown Table
+      const items: Partial<InvoiceItem>[] = [];
+      const lines = textResponse.split('\n');
+      let inTable = false;
+      
+      for (const line of lines) {
+        if (line.includes('|') && line.includes('---')) {
+          inTable = true;
+          continue;
+        }
+        if (!inTable && line.includes('|') && (line.toLowerCase().includes('description') || line.toLowerCase().includes('quantity'))) {
+           // Header row, skip but mark start
+           continue;
+        }
+        
+        if (line.trim().startsWith('|')) {
+          const cols = line.split('|').map(c => c.trim()).filter(c => c !== '');
+          if (cols.length >= 3) {
+            const raw_name = cols[0];
+            const raw_quantity = parseFloat(cols[1].replace(/[^0-9.]/g, '')) || 1;
+            const raw_price = parseFloat(cols[2].replace(/[^0-9.]/g, '')) || 0;
+            
+            // Basic validation to skip header/separator lines if they slipped through
+            if (!raw_name.includes('---') && raw_name.toLowerCase() !== 'description') {
+               items.push({ raw_name, raw_quantity, raw_price });
             }
           }
         }
-      });
-      const result = safeJSONParse(response.text || "{}", { items: [] });
-      return result.items || [];
-    }
-  });
+      }
+      return items;
+    });
+
+    allItems = [...allItems, ...chunkItems];
+  }
+
+  return allItems;
 };
 
 // --- 3. RAG Mapping (Phase 2 & 3) ---
@@ -225,7 +324,8 @@ const extractRawItems = async (imageBase64: string, config: AIConfig): Promise<P
 const mapItemsWithRAG = async (
   rawItems: Partial<InvoiceItem>[], 
   database: Product[], 
-  config: AIConfig
+  config: AIConfig,
+  feedback?: { incorrectItems: InvoiceItem[] }
 ): Promise<InvoiceItem[]> => {
   const apiKey = getEffectiveKey(config);
   
@@ -239,10 +339,9 @@ const mapItemsWithRAG = async (
         if (config.provider === 'openai') {
             queryEmbedding = await retryOperation(() => embedTextOpenAI(item.raw_name!, apiKey!));
         } else {
-            const embedKey = config.provider === 'anthropic' ? process.env.API_KEY : apiKey;
-            if (embedKey) {
+            if (apiKey) {
                 // Use retry for query embedding too
-                queryEmbedding = await retryOperation(() => embedTextGemini(item.raw_name!, embedKey));
+                queryEmbedding = await retryOperation(() => embedTextGemini(item.raw_name!, apiKey));
             }
         }
     } catch (e) { console.warn("Embedding failed for item", item.raw_name); }
@@ -257,7 +356,8 @@ const mapItemsWithRAG = async (
 
   // B. Synthesis Step: Ask LLM to pick the best one
   // BATCHING: Split items into chunks to avoid output token limits and JSON truncation
-  const CHUNK_SIZE = 8;
+  // OPTIMIZATION: Increased chunk size for speed (gpt-4o-mini handles larger context well)
+  const CHUNK_SIZE = config.provider === 'openai' ? 40 : 15;
   const chunkedItems = [];
   for (let i = 0; i < itemsWithCandidates.length; i += CHUNK_SIZE) {
     chunkedItems.push(itemsWithCandidates.slice(i, i + CHUNK_SIZE));
@@ -265,15 +365,32 @@ const mapItemsWithRAG = async (
 
   let finalMappedResults: any[] = [];
 
-  for (const chunk of chunkedItems) {
+  let feedbackPrompt = "";
+  if (feedback && feedback.incorrectItems.length > 0) {
+      feedbackPrompt = `
+      PREVIOUS ATTEMPT FEEDBACK:
+      The user marked the following mappings as INCORRECT in a previous run.
+      Please try to find a DIFFERENT or BETTER match for these items. If no good match exists, set matched_product_id to null.
+      
+      Incorrect Mappings:
+      ${JSON.stringify(feedback.incorrectItems.map(i => ({ 
+          raw_name: i.raw_name, 
+          previous_match_id: i.matched_product_id 
+      })), null, 2)}
+      `;
+  }
+
+  // Parallelize mapping chunks for OpenAI
+  const processChunk = async (chunk: any[]) => {
     const prompt = `
       You are a mapping agent. Map the RAW INVOICE ITEMS to the CANDIDATE PRODUCTS.
       
       Instructions:
-      1. For each item, look at the provided "Candidates" (which were retrieved via vector search).
+      1. For each item, look at the provided "Candidates".
       2. Select the ID of the product that is the exact or logical match.
       3. If none of the candidates are a correct match, return matched_product_id: null.
-      4. Provide a confidence score (0.0 - 1.0).
+
+      ${feedbackPrompt}
 
       ITEMS TO MAP:
       ${JSON.stringify(chunk.map((i: any) => ({
@@ -287,17 +404,16 @@ const mapItemsWithRAG = async (
       })), null, 2)}
 
       OUTPUT:
-      Return a JSON Object with a key "mappings" containing an Array of { raw_name, matched_product_id, confidence_score }.
+      Return a JSON Object with a key "mappings" containing an Array of { raw_name, matched_product_id }.
     `;
 
-    // Process chunk with retry
-    const chunkResults = await retryOperation(async () => {
+    return await retryOperation(async () => {
       if (config.provider === 'openai') {
           const response = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
           body: JSON.stringify({
-              model: "gpt-4o",
+              model: "gpt-4o-mini", // Optimized for speed
               messages: [{ role: "system", content: "Return strictly JSON object." }, { role: "user", content: prompt }],
               response_format: { type: "json_object" }
           })
@@ -305,19 +421,6 @@ const mapItemsWithRAG = async (
           const data = await response.json();
           const content = safeJSONParse(data.choices[0].message.content, { mappings: [] });
           return content.mappings || [];
-      } else if (config.provider === 'anthropic') {
-          const response = await fetch("https://api.anthropic.com/v1/messages", {
-              method: "POST",
-              headers: { "x-api-key": apiKey!, "anthropic-version": "2023-06-01", "content-type": "application/json", "anthropic-dangerously-allow-browser": "true" },
-              body: JSON.stringify({
-              model: "claude-3-5-sonnet-20241022", max_tokens: 4096,
-              messages: [{ role: "user", content: prompt + " Return JSON Object." }]
-              })
-          });
-          const data = await response.json();
-          const text = data.content[0].text;
-          const parsed = safeJSONParse(text, { mappings: [] });
-          return parsed.mappings || [];
       } else {
           const ai = new GoogleGenAI({ apiKey: apiKey! });
           const response = await ai.models.generateContent({
@@ -329,8 +432,18 @@ const mapItemsWithRAG = async (
           return parsed.mappings || [];
       }
     });
+  };
 
-    finalMappedResults = [...finalMappedResults, ...chunkResults];
+  if (config.provider === 'openai') {
+    // Parallel execution for OpenAI
+    const results = await Promise.all(chunkedItems.map(processChunk));
+    finalMappedResults = results.flat();
+  } else {
+    // Serial execution for Gemini (Rate limits)
+    for (const chunk of chunkedItems) {
+        const res = await processChunk(chunk);
+        finalMappedResults = [...finalMappedResults, ...res];
+    }
   }
 
   // Merge results back
@@ -342,8 +455,7 @@ const mapItemsWithRAG = async (
         raw_name: raw.raw_name!,
         raw_quantity: raw.raw_quantity || 0,
         raw_price: raw.raw_price || 0,
-        matched_product_id: decision?.matched_product_id || null,
-        confidence_score: decision?.confidence_score || 0
+        matched_product_id: decision?.matched_product_id || null
     };
   });
 };
@@ -351,16 +463,17 @@ const mapItemsWithRAG = async (
 // --- Main Workflow ---
 
 export const processInvoice = async (
-  imageBase64: string,
+  imageBase64: string | string[],
   database: Product[],
-  config: AIConfig
+  config: AIConfig,
+  feedback?: { incorrectItems: InvoiceItem[] }
 ): Promise<InvoiceItem[]> => {
     // Phase 1: OCR
-    const rawItems = await extractRawItems(imageBase64, config);
+    const rawItems = await extractRawItems(imageBase64, config, database, feedback);
     if (rawItems.length === 0) return [];
 
     // Phase 2 & 3: RAG & Mapping
-    const finalItems = await mapItemsWithRAG(rawItems, database, config);
+    const finalItems = await mapItemsWithRAG(rawItems, database, config, feedback);
     
     return finalItems;
 };
