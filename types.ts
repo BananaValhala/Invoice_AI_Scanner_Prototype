@@ -5,6 +5,7 @@ export interface Product {
   unit: string;
   category?: string;
   embedding?: number[];
+  metadata?: Record<string, string>;
 }
 
 export interface InvoiceItem {
@@ -12,6 +13,8 @@ export interface InvoiceItem {
   raw_price: number;
   raw_quantity: number;
   matched_product_id: string | null;
+  reasoning?: string;
+  candidates?: Product[];
 }
 
 export interface ProcessedInvoice {

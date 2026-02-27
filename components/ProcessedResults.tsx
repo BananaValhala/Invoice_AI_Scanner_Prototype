@@ -141,12 +141,52 @@ export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, dat
                             <div>
                             <div className="font-medium text-slate-800">{matchedProduct.localName}</div>
                             <div className="text-xs text-slate-500">{matchedProduct.name} ({matchedProduct.id})</div>
+                            {item.reasoning && (
+                                <div className="text-[10px] text-slate-400 mt-1 italic border-l-2 border-slate-200 pl-2">
+                                    "{item.reasoning}"
+                                </div>
+                            )}
+                            {item.candidates && item.candidates.length > 0 && (
+                                <details className="mt-1">
+                                    <summary className="text-[10px] text-indigo-500 cursor-pointer hover:underline select-none">
+                                        View {item.candidates.length} Candidates
+                                    </summary>
+                                    <div className="pl-2 border-l-2 border-indigo-100 mt-1">
+                                        {item.candidates.map(c => (
+                                            <div key={c.id} className="text-[10px] text-slate-500 truncate" title={`${c.name} / ${c.localName}`}>
+                                                • {c.localName} ({c.name})
+                                            </div>
+                                        ))}
+                                    </div>
+                                </details>
+                            )}
                             </div>
                         </div>
                         ) : (
-                        <div className="flex items-center gap-2 text-slate-400 italic">
-                            <AlertCircle size={16} />
-                            <span>No match found</span>
+                        <div className="flex flex-col gap-1 text-slate-400 italic">
+                            <div className="flex items-center gap-2">
+                                <AlertCircle size={16} />
+                                <span>No match found</span>
+                            </div>
+                            {item.reasoning && (
+                                <div className="text-[10px] text-slate-400 ml-6 border-l-2 border-slate-200 pl-2">
+                                    "{item.reasoning}"
+                                </div>
+                            )}
+                            {item.candidates && item.candidates.length > 0 && (
+                                <details className="ml-6">
+                                    <summary className="text-[10px] text-indigo-500 cursor-pointer hover:underline select-none">
+                                        View {item.candidates.length} Candidates
+                                    </summary>
+                                    <div className="pl-2 border-l-2 border-indigo-100 mt-1">
+                                        {item.candidates.map(c => (
+                                            <div key={c.id} className="text-[10px] text-slate-500 truncate" title={`${c.name} / ${c.localName}`}>
+                                                • {c.localName} ({c.name})
+                                            </div>
+                                        ))}
+                                    </div>
+                                </details>
+                            )}
                         </div>
                         )}
                     </td>

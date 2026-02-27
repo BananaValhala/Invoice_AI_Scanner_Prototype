@@ -121,7 +121,8 @@ export const generateEmbeddingsForDatabase = async (
         if (product.embedding && product.embedding.length > 0) return;
 
         // Sanitize input
-        const textToEmbed = `${product.name} ${product.localName} ${product.category || ''}`.trim();
+        const metadataText = product.metadata ? Object.values(product.metadata).join(' ') : '';
+        const textToEmbed = `${product.name} ${product.localName} ${product.category || ''} ${metadataText}`.trim();
         if (!textToEmbed) return;
         
         try {
@@ -172,13 +173,23 @@ const extractRawItems = async (
   const imageChunks = Array.isArray(imageBase64) ? imageBase64 : [imageBase64];
   let allItems: Partial<InvoiceItem>[] = [];
 
-  // Create a context string from the database (limited to avoid token limits if DB is huge)
-  // We'll take a sample or just list names if it's reasonable. 
-  // For a prototype, we can list up to ~500 names or use a more sophisticated retrieval if needed.
-  // Here we'll just take the first 200 names as a "vocabulary hint" to keep it simple but effective.
-  const vocabularyHint = database
+  // Refined Vocabulary Hint Generation:
+  // Prioritize "complex" products: those with local names (often non-English/harder to OCR) 
+  // or metadata (specific variants), and longer names.
+  // This helps the model recognize difficult items.
+  const vocabularyHint = [...database]
+    .sort((a, b) => {
+        // Heuristic: Local Name (20pts) + Metadata (10pts) + Length (1pt per char)
+        const scoreA = (a.localName ? 20 : 0) + (a.metadata ? 10 : 0) + a.name.length;
+        const scoreB = (b.localName ? 20 : 0) + (b.metadata ? 10 : 0) + b.name.length;
+        return scoreB - scoreA;
+    })
     .slice(0, 200)
-    .map(p => p.name)
+    .map(p => {
+        let hint = p.name;
+        if (p.localName) hint += ` / ${p.localName}`;
+        return hint;
+    })
     .join(", ");
 
   let feedbackPrompt = "";
@@ -257,7 +268,7 @@ const extractRawItems = async (
             method: "POST",
             headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
             body: JSON.stringify({
-              model: "gpt-4o-mini", 
+              model: "gpt-4o", 
               messages: [
                 { role: "system", content: "You are an expert OCR agent. You output strictly Markdown tables." },
                 { role: "user", content: [{ type: "text", text: chunkPrompt }, { type: "image_url", image_url: { url: `data:image/jpeg;base64,${chunkBase64}`, detail: "high" } }] }
@@ -382,31 +393,54 @@ const mapItemsWithRAG = async (
 
   // Parallelize mapping chunks for OpenAI
   const processChunk = async (chunk: any[]) => {
+    // Dynamically detect all metadata keys present in this chunk's candidates
+    const metadataKeys = new Set<string>();
+    chunk.forEach((i: any) => {
+        i.candidates.forEach((c: Product) => {
+            if (c.metadata) Object.keys(c.metadata).forEach(k => metadataKeys.add(k));
+        });
+    });
+    const keysList = Array.from(metadataKeys).join(', ');
+
     const prompt = `
       You are a strict mapping agent. Map the RAW INVOICE ITEMS to the CANDIDATE PRODUCTS.
       
       Instructions:
-      1. For each item, look at the provided "Candidates".
-      2. Select the ID of the product that is the EXACT or HIGHLY LOGICAL match.
-      3. CRITICAL: If none of the candidates are a strong match, return matched_product_id: null.
-      4. DO NOT FORCE A MATCH. It is better to return null than to map to the wrong product.
-      5. If the raw name describes a product that is clearly different from all candidates (e.g. different brand, different size, different flavor), return null.
+      1. Analyze the "raw_name", "raw_quantity", and "calculated_unit_price" from the invoice.
+      2. Compare against each "Candidate". Look at 'name', 'localName', and ALL 'metadata' fields.
+      3. **Strict Matching Rules**:
+         - **Dynamic Metadata Validation**: Strictly validate against these detected database columns: [${keysList}].
+           - If the database has a column (e.g. "Brand", "Flavor", "Size", "Barcode"), the raw item MUST match it or be compatible.
+           - Example: If metadata "Brand" is "Pepsi", do not map a raw item saying "Coke".
+           - Example: If metadata "Size" is "1L", do not map a raw item saying "325ml".
+         - **Origin/Location Trap**: Do NOT match solely because the Origin matches (e.g. "Hokkaido"). "Scallop Hokkaido" is NOT "Surf Clam Hokkaido". The CORE PRODUCT NAME must match.
+         - **Price Check**: If metadata contains price information, compare it with "calculated_unit_price". Significant deviation suggests a mismatch (or different pack size).
+      4. Select the ID of the product that satisfies these rules.
+      5. **CRITICAL**: If NO candidate satisfies these rules, return matched_product_id: null.
+      6. Provide a brief "reasoning" for your decision (e.g. "Exact match on name and [Field Name]", "Mismatch on [Field Name]", "Price deviation too high", "Rejected: Only location matches").
 
       ${feedbackPrompt}
 
       ITEMS TO MAP:
       ${JSON.stringify(chunk.map((i: any) => ({
         raw_name: i.raw_name,
-        raw_price: i.raw_price,
+        raw_quantity: i.raw_quantity,
+        raw_total_price: i.raw_price,
+        calculated_unit_price: i.raw_quantity ? (i.raw_price / i.raw_quantity).toFixed(2) : i.raw_price,
         candidates: i.candidates.map((c: Product) => ({
           id: c.id,
           name: c.name,
-          localName: c.localName
+          localName: c.localName,
+          metadata: c.metadata
         }))
       })), null, 2)}
 
       OUTPUT:
-      Return a JSON Object with a key "mappings" containing an Array of { raw_name, matched_product_id }.
+      Return a JSON Object with a key "mappings" containing an Array of { 
+        raw_name: string, 
+        matched_product_id: string | null,
+        reasoning: string 
+      }.
     `;
 
     return await retryOperation(async () => {
@@ -415,7 +449,7 @@ const mapItemsWithRAG = async (
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
           body: JSON.stringify({
-              model: "gpt-4o-mini", // Optimized for speed
+              model: "gpt-4o", // High reasoning power
               messages: [{ role: "system", content: "Return strictly JSON object." }, { role: "user", content: prompt }],
               response_format: { type: "json_object" }
           })
@@ -457,7 +491,9 @@ const mapItemsWithRAG = async (
         raw_name: raw.raw_name!,
         raw_quantity: raw.raw_quantity || 0,
         raw_price: raw.raw_price || 0,
-        matched_product_id: decision?.matched_product_id || null
+        matched_product_id: decision?.matched_product_id || null,
+        reasoning: decision?.reasoning, // Capture reasoning
+        candidates: itemsWithCandidates[idx]?.candidates || [] // Capture candidates for debugging
     };
   });
 };

@@ -15,6 +15,9 @@ export const DatabaseViewer: React.FC<DatabaseViewerProps> = ({ data }) => {
     item.id.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
+  // Extract all unique metadata keys from the dataset to create dynamic columns
+  const metadataKeys = Array.from(new Set(data.flatMap(p => p.metadata ? Object.keys(p.metadata) : [])));
+
   return (
     <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden flex flex-col h-full">
       <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
@@ -47,24 +50,34 @@ export const DatabaseViewer: React.FC<DatabaseViewerProps> = ({ data }) => {
           <table className="w-full text-sm text-left">
             <thead className="text-xs text-slate-500 uppercase bg-slate-50 sticky top-0">
               <tr>
-                <th className="px-4 py-3">ID</th>
-                <th className="px-4 py-3">Local Name</th>
-                <th className="px-4 py-3">EN Name</th>
-                <th className="px-4 py-3">Unit</th>
+                <th className="px-4 py-3 whitespace-nowrap">ID</th>
+                <th className="px-4 py-3 whitespace-nowrap">Local Name</th>
+                <th className="px-4 py-3 whitespace-nowrap">EN Name</th>
+                <th className="px-4 py-3 whitespace-nowrap">Unit</th>
+                {metadataKeys.map(key => (
+                  <th key={key} className="px-4 py-3 whitespace-nowrap bg-slate-100 text-slate-600 border-l border-slate-200">
+                    {key}
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {filteredData.slice(0, 100).map((product) => (
                 <tr key={product.id} className="hover:bg-slate-50">
-                  <td className="px-4 py-2 font-mono text-xs text-slate-500">{product.id}</td>
-                  <td className="px-4 py-2 font-medium text-slate-800">{product.localName}</td>
-                  <td className="px-4 py-2 text-slate-600">{product.name}</td>
-                  <td className="px-4 py-2 text-slate-500">{product.unit}</td>
+                  <td className="px-4 py-2 font-mono text-xs text-slate-500 whitespace-nowrap">{product.id}</td>
+                  <td className="px-4 py-2 font-medium text-slate-800 whitespace-nowrap">{product.localName}</td>
+                  <td className="px-4 py-2 text-slate-600 whitespace-nowrap">{product.name}</td>
+                  <td className="px-4 py-2 text-slate-500 whitespace-nowrap">{product.unit}</td>
+                  {metadataKeys.map(key => (
+                    <td key={key} className="px-4 py-2 text-slate-500 text-xs border-l border-slate-100 whitespace-nowrap">
+                      {product.metadata?.[key] || '-'}
+                    </td>
+                  ))}
                 </tr>
               ))}
               {filteredData.length > 100 && (
                 <tr>
-                  <td colSpan={4} className="px-4 py-3 text-center text-xs text-slate-400 italic">
+                  <td colSpan={4 + metadataKeys.length} className="px-4 py-3 text-center text-xs text-slate-400 italic">
                     Showing first 100 matches...
                   </td>
                 </tr>

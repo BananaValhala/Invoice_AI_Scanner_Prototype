@@ -2,19 +2,58 @@ import { Product } from '../types';
 
 export const parseCSV = (text: string): Product[] => {
   const lines = text.split('\n').filter(line => line.trim() !== '');
-  // Assuming simple CSV: ID, English Name, Local/Alt Name, Unit, Category
+  if (lines.length < 2) return [];
+
+  // Parse Header
+  const headerLine = lines[0];
+  const headers = headerLine.split(',').map(h => h.trim().replace(/^"|"$/g, '').toLowerCase());
+
+  // Helper to find column index by name (fuzzy match)
+  const findCol = (keywords: string[]) => headers.findIndex(h => keywords.some(k => h.includes(k)));
+
+  const idIdx = findCol(['id', 'code', 'sku']);
+  const nameIdx = findCol(['name', 'product', 'description', 'english']);
+  const localNameIdx = findCol(['local', 'alt', 'native', 'thai', 'chinese']);
+  const unitIdx = findCol(['unit', 'uom']);
+  const categoryIdx = findCol(['category', 'group', 'type']);
+
   // Skip header
   const data = lines.slice(1).map((line, index) => {
     // Handle quotes in CSV if necessary, simple split for prototype
-    const cols = line.split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+    // Note: A robust CSV parser (like PapaParse) is better for production, 
+    // but for this prototype we'll do a basic split that handles some quotes.
+    const cols: string[] = [];
+    let inQuote = false;
+    let current = '';
     
-    // Fallback if CSV structure varies, but mapping to our type
+    for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+        if (char === '"') {
+            inQuote = !inQuote;
+        } else if (char === ',' && !inQuote) {
+            cols.push(current.trim().replace(/^"|"$/g, ''));
+            current = '';
+        } else {
+            current += char;
+        }
+    }
+    cols.push(current.trim().replace(/^"|"$/g, ''));
+
+    // Capture all other columns as metadata
+    const metadata: Record<string, string> = {};
+    headers.forEach((h, i) => {
+        if (i !== idIdx && i !== nameIdx && i !== localNameIdx && i !== unitIdx && i !== categoryIdx) {
+            if (cols[i]) metadata[h] = cols[i];
+        }
+    });
+    
     return {
-      id: cols[0] || `TEMP-${index}`,
-      name: cols[1] || 'Unknown',
-      localName: cols[2] || '',
-      unit: cols[3] || 'pcs',
-      category: cols[4] || 'General'
+      id: (idIdx >= 0 ? cols[idIdx] : cols[0]) || `TEMP-${index}`,
+      name: (nameIdx >= 0 ? cols[nameIdx] : cols[1]) || 'Unknown',
+      localName: (localNameIdx >= 0 ? cols[localNameIdx] : cols[2]) || '',
+      unit: (unitIdx >= 0 ? cols[unitIdx] : cols[3]) || 'pcs',
+      category: (categoryIdx >= 0 ? cols[categoryIdx] : cols[4]) || 'General',
+      metadata: metadata // Store extra columns here
     };
   });
   return data;
@@ -105,62 +144,6 @@ export const preprocessImage = (file: File): Promise<string[]> => {
       img.src = e.target?.result as string;
     };
     reader.onerror = reject;
-  });
-};
-
-export const preprocessForOCR = (base64: string): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => {
-      // Scale up for better OCR (target width ~2500px for A4 receipts)
-      // Tesseract works best when characters are large (20px+ height)
-      const targetWidth = 2500;
-      const scale = img.width < targetWidth ? targetWidth / img.width : 1;
-      const width = Math.round(img.width * scale);
-      const height = Math.round(img.height * scale);
-
-      const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        reject(new Error('Canvas context not available'));
-        return;
-      }
-      
-      // High quality scaling
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(img, 0, 0, width, height);
-      
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const data = imageData.data;
-      
-      // Binarization (Thresholding)
-      // Converting to pure black and white helps Tesseract separate text from background noise
-      const threshold = 180; // Slightly higher threshold for faint text on receipts
-      
-      for (let i = 0; i < data.length; i += 4) {
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
-        
-        // Luminance
-        const gray = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        
-        // Simple Threshold
-        const val = gray > threshold ? 255 : 0;
-        
-        data[i] = val;
-        data[i + 1] = val;
-        data[i + 2] = val;
-      }
-      
-      ctx.putImageData(imageData, 0, 0);
-      resolve(canvas.toDataURL('image/jpeg', 0.9).split(',')[1]);
-    };
-    img.onerror = reject;
-    img.src = `data:image/jpeg;base64,${base64}`;
   });
 };
 
