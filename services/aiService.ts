@@ -383,12 +383,14 @@ const mapItemsWithRAG = async (
   // Parallelize mapping chunks for OpenAI
   const processChunk = async (chunk: any[]) => {
     const prompt = `
-      You are a mapping agent. Map the RAW INVOICE ITEMS to the CANDIDATE PRODUCTS.
+      You are a strict mapping agent. Map the RAW INVOICE ITEMS to the CANDIDATE PRODUCTS.
       
       Instructions:
       1. For each item, look at the provided "Candidates".
-      2. Select the ID of the product that is the exact or logical match.
-      3. If none of the candidates are a correct match, return matched_product_id: null.
+      2. Select the ID of the product that is the EXACT or HIGHLY LOGICAL match.
+      3. CRITICAL: If none of the candidates are a strong match, return matched_product_id: null.
+      4. DO NOT FORCE A MATCH. It is better to return null than to map to the wrong product.
+      5. If the raw name describes a product that is clearly different from all candidates (e.g. different brand, different size, different flavor), return null.
 
       ${feedbackPrompt}
 
