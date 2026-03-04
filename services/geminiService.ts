@@ -52,7 +52,7 @@ export const processInvoiceImage = async (
 
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
+      model: 'gemini-3.1-flash-lite-preview',
       contents: {
         parts: [
           {

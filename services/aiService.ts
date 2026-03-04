@@ -31,24 +31,66 @@ const safeJSONParse = <T>(text: string, fallback: T): T => {
 
 // --- 1. Embedding Generation ---
 
-const embedTextGemini = async (text: string, apiKey: string): Promise<number[]> => {
-  const ai = new GoogleGenAI({ apiKey });
-  const response = await ai.models.embedContent({
-    model: 'gemini-embedding-001',
-    contents: { parts: [{ text }] }
-  });
-  return response.embeddings?.[0]?.values || [];
+const embedTextsGemini = async (texts: string[], apiKey: string): Promise<number[][]> => {
+  const BATCH_SIZE = 100; // Gemini batch limit
+  const allEmbeddings: number[][] = [];
+  
+  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+      const chunk = texts.slice(i, i + BATCH_SIZE);
+      
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:batchEmbedContents?key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+              requests: chunk.map(text => ({
+                  model: 'models/gemini-embedding-001',
+                  content: { parts: [{ text }] }
+              }))
+          })
+      });
+
+      if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(`Gemini Batch Embed Error: ${response.status} - ${JSON.stringify(errorData)}`);
+      }
+
+      const data = await response.json();
+      const chunkEmbeddings = data.embeddings?.map((e: any) => e.values || []) || [];
+      
+      // Ensure alignment
+      if (chunkEmbeddings.length === chunk.length) {
+          allEmbeddings.push(...chunkEmbeddings);
+      } else {
+          console.warn("Mismatch in returned embeddings count, padding with empty arrays");
+          chunk.forEach((_, idx) => {
+              allEmbeddings.push(chunkEmbeddings[idx] || []);
+          });
+      }
+  }
+  
+  return allEmbeddings;
 };
 
-const embedTextOpenAI = async (text: string, apiKey: string): Promise<number[]> => {
-  const response = await fetch("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-    body: JSON.stringify({ model: "text-embedding-3-small", input: text })
-  });
-  const data = await response.json();
-  if (data.error) throw new Error(data.error.message);
-  return data.data[0].embedding;
+const embedTextsOpenAI = async (texts: string[], apiKey: string): Promise<number[][]> => {
+  const BATCH_SIZE = 100; // Safe batch size
+  const allEmbeddings: number[][] = [];
+
+  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+    const chunk = texts.slice(i, i + BATCH_SIZE);
+    const response = await fetch("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+      body: JSON.stringify({ model: "text-embedding-3-small", input: chunk })
+    });
+    const data = await response.json();
+    if (data.error) throw new Error(data.error.message);
+    
+    const chunkEmbeddings = data.data
+        .sort((a: any, b: any) => a.index - b.index)
+        .map((d: any) => d.embedding);
+    allEmbeddings.push(...chunkEmbeddings);
+  }
+  return allEmbeddings;
 };
 
 // Retry helper for rate limits and transient server errors
@@ -97,62 +139,45 @@ export const generateEmbeddingsForDatabase = async (
 
   const updatedProducts = [...products];
   
-  // For OpenAI, we can parallelize more aggressively.
-  // For Gemini, we still need to be careful with rate limits on the free tier.
-  const BATCH_SIZE = config.provider === 'openai' ? 20 : 1; 
+  // Larger batch size since we are using batch APIs
+  const BATCH_SIZE = 50; 
   
   for (let i = 0; i < updatedProducts.length; i += BATCH_SIZE) {
     const batch = updatedProducts.slice(i, i + BATCH_SIZE);
     
-    // Optimization: Check if ALL items in this batch already have embeddings
-    const allEmbedded = batch.every(p => p.embedding && p.embedding.length > 0);
+    // Identify items needing embeddings
+    const itemsToEmbed = batch.filter(p => !p.embedding || p.embedding.length === 0);
     
-    if (allEmbedded) {
-        // Skip API calls and delay entirely for this batch
-        if (onProgress) {
-            // Update progress immediately but don't sleep
-            onProgress(Math.min(i + BATCH_SIZE, updatedProducts.length), updatedProducts.length);
-        }
-        continue; 
-    }
+    if (itemsToEmbed.length > 0) {
+        const textsToEmbed = itemsToEmbed.map(product => {
+            const metadataText = product.metadata ? Object.values(product.metadata).join(' ') : '';
+            return `${product.name} ${product.localName} ${product.category || ''} ${metadataText}`.trim();
+        });
 
-    await Promise.all(batch.map(async (product) => {
-        // Skip if already has embedding
-        if (product.embedding && product.embedding.length > 0) return;
-
-        // Sanitize input
-        const metadataText = product.metadata ? Object.values(product.metadata).join(' ') : '';
-        const textToEmbed = `${product.name} ${product.localName} ${product.category || ''} ${metadataText}`.trim();
-        if (!textToEmbed) return;
-        
         try {
-          const embedding = await retryOperation(async () => {
-            if (config.provider === 'openai') {
-              return await embedTextOpenAI(textToEmbed, apiKey);
-            } else {
-              // Default to Gemini
-              if (apiKey) {
-                 return await embedTextGemini(textToEmbed, apiKey);
-              }
-              return undefined;
-            }
-          });
-          
-          product.embedding = embedding;
-    
+            const embeddings = await retryOperation(async () => {
+                if (config.provider === 'openai') {
+                    return await embedTextsOpenAI(textsToEmbed, apiKey);
+                } else {
+                    return await embedTextsGemini(textsToEmbed, apiKey);
+                }
+            });
+
+            // Assign embeddings back to products
+            itemsToEmbed.forEach((product, idx) => {
+                product.embedding = embeddings[idx];
+            });
         } catch (e) {
-          console.error(`Failed to embed ${product.id}`, e);
-          // Continue processing other items even if one fails
+            console.error(`Failed to embed batch starting at ${i}`, e);
         }
-    }));
+    }
 
     if (onProgress) {
       onProgress(Math.min(i + BATCH_SIZE, updatedProducts.length), updatedProducts.length);
     }
     
-    // Minimal delay for OpenAI, longer for Gemini
-    const delay = config.provider === 'openai' ? 10 : 200;
-    await sleep(delay);
+    // Minimal delay
+    await sleep(50);
   }
 
   return updatedProducts;
@@ -237,15 +262,13 @@ const extractRawItems = async (
     | Product B | 1 | 500 |
   `;
 
-  // Process chunks sequentially
-  for (let i = 0; i < imageChunks.length; i++) {
-    const chunkBase64 = imageChunks[i];
-    
+  // Process chunks in parallel
+  const chunkPromises = imageChunks.map(async (chunkBase64, i) => {
     const chunkPrompt = imageChunks.length > 1 
       ? `${prompt}\n\nNOTE: This is part ${i + 1} of ${imageChunks.length} of a long invoice. Extract items visible in this section.`
       : prompt;
 
-    const chunkItems = await retryOperation(async () => {
+    return await retryOperation(async () => {
       let textResponse = "";
       
       if (config.provider === 'openai') {
@@ -256,7 +279,7 @@ const extractRawItems = async (
         if (geminiApiKey) {
            const ai = new GoogleGenAI({ apiKey: geminiApiKey });
            const response = await ai.models.generateContent({
-             model: 'gemini-3-flash-preview',
+             model: 'gemini-3.1-flash-lite-preview',
              contents: {
                parts: [{ inlineData: { mimeType: 'image/jpeg', data: chunkBase64 } }, { text: chunkPrompt }]
              }
@@ -284,7 +307,7 @@ const extractRawItems = async (
         // Gemini
         const ai = new GoogleGenAI({ apiKey });
         const response = await ai.models.generateContent({
-          model: 'gemini-3-flash-preview',
+          model: 'gemini-3.1-flash-lite-preview',
           contents: {
             parts: [{ inlineData: { mimeType: 'image/jpeg', data: chunkBase64 } }, { text: chunkPrompt }]
           }
@@ -323,9 +346,12 @@ const extractRawItems = async (
       }
       return items;
     });
+  });
 
+  const results = await Promise.all(chunkPromises);
+  results.forEach(chunkItems => {
     allItems = [...allItems, ...chunkItems];
-  }
+  });
 
   return allItems;
 };
@@ -341,34 +367,42 @@ const mapItemsWithRAG = async (
   const apiKey = getEffectiveKey(config);
   
   // A. Retrieval Step: Find candidates for each item
-  const itemsWithCandidates = await Promise.all(rawItems.map(async (item) => {
-    if (!item.raw_name) return { ...item, candidates: [] };
-    
-    // Embed the query
-    let queryEmbedding: number[] = [];
-    try {
+  // BATCHING OPTIMIZATION: Embed all queries in batches
+  const validIndices = rawItems.map((item, idx) => item.raw_name ? idx : -1).filter(idx => idx !== -1);
+  const queryTexts = validIndices.map(idx => rawItems[idx].raw_name!);
+  
+  let queryEmbeddings: number[][] = [];
+  if (queryTexts.length > 0) {
+      try {
         if (config.provider === 'openai') {
-            queryEmbedding = await retryOperation(() => embedTextOpenAI(item.raw_name!, apiKey!));
+            queryEmbeddings = await retryOperation(() => embedTextsOpenAI(queryTexts, apiKey!));
         } else {
             if (apiKey) {
-                // Use retry for query embedding too
-                queryEmbedding = await retryOperation(() => embedTextGemini(item.raw_name!, apiKey));
+                queryEmbeddings = await retryOperation(() => embedTextsGemini(queryTexts, apiKey));
             }
         }
-    } catch (e) { console.warn("Embedding failed for item", item.raw_name); }
+      } catch (e) { console.error("Batch embedding failed", e); }
+  }
+
+  const itemsWithCandidates = rawItems.map((item, idx) => {
+    if (!item.raw_name) return { ...item, candidates: [] };
+    
+    // Find embedding for this item
+    const embeddingIndex = validIndices.indexOf(idx);
+    const embedding = (embeddingIndex !== -1 && queryEmbeddings[embeddingIndex]) ? queryEmbeddings[embeddingIndex] : [];
 
     // Vector Search
-    const candidates = queryEmbedding.length > 0 
-        ? findNearestNeighbors(queryEmbedding, database, 5) // Top 5
+    const candidates = embedding.length > 0 
+        ? findNearestNeighbors(embedding, database, 5) // Top 5
         : []; 
         
     return { ...item, candidates };
-  }));
+  });
 
   // B. Synthesis Step: Ask LLM to pick the best one
   // BATCHING: Split items into chunks to avoid output token limits and JSON truncation
   // OPTIMIZATION: Increased chunk size for speed (gpt-4o-mini handles larger context well)
-  const CHUNK_SIZE = config.provider === 'openai' ? 40 : 15;
+  const CHUNK_SIZE = config.provider === 'openai' ? 40 : 100;
   const chunkedItems = [];
   for (let i = 0; i < itemsWithCandidates.length; i += CHUNK_SIZE) {
     chunkedItems.push(itemsWithCandidates.slice(i, i + CHUNK_SIZE));
@@ -417,7 +451,7 @@ const mapItemsWithRAG = async (
          - **Price Check**: If metadata contains price information, compare it with "calculated_unit_price". Significant deviation suggests a mismatch (or different pack size).
       4. Select the ID of the product that satisfies these rules.
       5. **CRITICAL**: If NO candidate satisfies these rules, return matched_product_id: null.
-      6. Provide a brief "reasoning" for your decision (e.g. "Exact match on name and [Field Name]", "Mismatch on [Field Name]", "Price deviation too high", "Rejected: Only location matches").
+      6. Provide a brief "reasoning" for your decision (MAX 5 WORDS. e.g. "Exact match on name/Brand", "Price deviation too high").
 
       ${feedbackPrompt}
 
@@ -460,7 +494,7 @@ const mapItemsWithRAG = async (
       } else {
           const ai = new GoogleGenAI({ apiKey: apiKey! });
           const response = await ai.models.generateContent({
-          model: 'gemini-3-flash-preview',
+          model: 'gemini-3.1-flash-lite-preview',
           contents: { parts: [{ text: prompt }] },
           config: { responseMimeType: 'application/json' }
           });

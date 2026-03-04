@@ -221,13 +221,16 @@ export default function App() {
               try {
                 if (!invoice.rawImageBase64) throw new Error("No image data");
                 
+                const processStartTime = Date.now();
                 const extractedItems = await processInvoice(invoice.rawImageBase64, currentDb, aiConfig);
+                const processTimeMs = Date.now() - processStartTime;
                 
                 setInvoices(prev => prev.map(inv => 
                   inv.id === invoice.id ? { 
                     ...inv, 
                     status: 'completed', 
-                    items: extractedItems 
+                    items: extractedItems,
+                    processTimeMs
                   } : inv
                 ));
               } catch (e: any) {
@@ -259,6 +262,7 @@ export default function App() {
       invoices: invoices.map(inv => ({
         fileName: inv.fileName,
         processedAt: inv.timestamp,
+        processTimeMs: inv.processTimeMs,
         items: inv.items
       }))
     };
@@ -418,6 +422,11 @@ export default function App() {
                         <span className="truncate text-slate-700 font-medium" title={inv.fileName}>{inv.fileName}</span>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
+                        {inv.processTimeMs !== undefined && (
+                          <span className="text-xs text-slate-500 font-mono">
+                            {(inv.processTimeMs / 1000).toFixed(1)}s
+                          </span>
+                        )}
                         <span className={`
                             text-xs px-2 py-0.5 rounded-full font-medium uppercase tracking-wide
                             ${inv.status === 'completed' ? 'bg-emerald-100 text-emerald-700' : ''}

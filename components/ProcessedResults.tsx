@@ -45,6 +45,11 @@ export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, dat
         </div>
         <div className="flex items-center gap-3">
             <span className="text-xs text-slate-400">{invoice.timestamp}</span>
+            {invoice.processTimeMs !== undefined && (
+              <span className="text-xs text-slate-500 bg-slate-200 px-2 py-0.5 rounded-full">
+                {(invoice.processTimeMs / 1000).toFixed(2)}s
+              </span>
+            )}
             {images.length > 0 && (
                 <button 
                     onClick={() => setShowPreview(!showPreview)}
