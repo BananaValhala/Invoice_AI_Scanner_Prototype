@@ -140,7 +140,7 @@ export const generateEmbeddingsForDatabase = async (
   const updatedProducts = [...products];
   
   // Larger batch size since we are using batch APIs
-  const BATCH_SIZE = 50; 
+  const BATCH_SIZE = 100; 
   
   for (let i = 0; i < updatedProducts.length; i += BATCH_SIZE) {
     const batch = updatedProducts.slice(i, i + BATCH_SIZE);
@@ -262,89 +262,85 @@ const extractRawItems = async (
     | Product B | 1 | 500 |
   `;
 
-  // Process chunks in parallel
+  const parseMarkdownTable = (textResponse: string): Partial<InvoiceItem>[] => {
+    const items: Partial<InvoiceItem>[] = [];
+    const lines = textResponse.split('\n');
+    let inTable = false;
+    
+    for (const line of lines) {
+      if (line.includes('|') && line.includes('---')) {
+        inTable = true;
+        continue;
+      }
+      if (!inTable && line.includes('|') && (line.toLowerCase().includes('description') || line.toLowerCase().includes('quantity'))) {
+         // Header row, skip but mark start
+         continue;
+      }
+      
+      if (line.trim().startsWith('|')) {
+        const cols = line.split('|').map(c => c.trim()).filter(c => c !== '');
+        if (cols.length >= 3) {
+          const raw_name = cols[0];
+          const raw_quantity = parseFloat(cols[1].replace(/[^0-9.]/g, '')) || 1;
+          const raw_price = parseFloat(cols[2].replace(/[^0-9.]/g, '')) || 0;
+          
+          // Basic validation to skip header/separator lines if they slipped through
+          if (!raw_name.includes('---') && raw_name.toLowerCase() !== 'description') {
+             items.push({ raw_name, raw_quantity, raw_price });
+          }
+        }
+      }
+    }
+    return items;
+  };
+
+  if (config.provider === 'openai') {
+    // OpenAI supports multiple images in a single API call.
+    // Batch all image chunks into one request for faster processing.
+    return await retryOperation(async () => {
+      const userContent: any[] = [{ type: "text", text: prompt }];
+      
+      imageChunks.forEach((chunkBase64, i) => {
+        if (imageChunks.length > 1) {
+          userContent.push({ type: "text", text: `Image part ${i + 1}:` });
+        }
+        userContent.push({ type: "image_url", image_url: { url: `data:image/jpeg;base64,${chunkBase64}`, detail: "high" } });
+      });
+
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: "gpt-5-mini", 
+          messages: [
+            { role: "system", content: "You are an expert OCR agent. You output strictly Markdown tables." },
+            { role: "user", content: userContent }
+          ]
+        })
+      });
+      
+      const data = await response.json();
+      if (data.error) throw new Error(data.error.message);
+      
+      return parseMarkdownTable(data.choices[0].message.content);
+    });
+  }
+
+  // Process chunks in parallel for Gemini
   const chunkPromises = imageChunks.map(async (chunkBase64, i) => {
     const chunkPrompt = imageChunks.length > 1 
       ? `${prompt}\n\nNOTE: This is part ${i + 1} of ${imageChunks.length} of a long invoice. Extract items visible in this section.`
       : prompt;
 
     return await retryOperation(async () => {
-      let textResponse = "";
-      
-      if (config.provider === 'openai') {
-        // Use Gemini Vision as OCR for OpenAI provider (Hybrid Approach)
-        // This leverages Gemini's superior free vision capabilities while keeping OpenAI for RAG/Mapping
-        const geminiApiKey = process.env.API_KEY; // Always use the system env key for Gemini
-        
-        if (geminiApiKey) {
-           const ai = new GoogleGenAI({ apiKey: geminiApiKey });
-           const response = await ai.models.generateContent({
-             model: 'gemini-3.1-flash-lite-preview',
-             contents: {
-               parts: [{ inlineData: { mimeType: 'image/jpeg', data: chunkBase64 } }, { text: chunkPrompt }]
-             }
-           });
-           textResponse = response.text || "";
-        } else {
-           // Fallback to OpenAI Vision (GPT-4o-mini) if no Gemini key available (unlikely in this env)
-           const response = await fetch("https://api.openai.com/v1/chat/completions", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-            body: JSON.stringify({
-              model: "gpt-4o", 
-              messages: [
-                { role: "system", content: "You are an expert OCR agent. You output strictly Markdown tables." },
-                { role: "user", content: [{ type: "text", text: chunkPrompt }, { type: "image_url", image_url: { url: `data:image/jpeg;base64,${chunkBase64}`, detail: "high" } }] }
-              ]
-            })
-          });
-          const data = await response.json();
-          if (data.error) throw new Error(data.error.message);
-          textResponse = data.choices[0].message.content;
+      const ai = new GoogleGenAI({ apiKey });
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.1-flash-lite-preview',
+        contents: {
+          parts: [{ inlineData: { mimeType: 'image/jpeg', data: chunkBase64 } }, { text: chunkPrompt }]
         }
-        
-      } else {
-        // Gemini
-        const ai = new GoogleGenAI({ apiKey });
-        const response = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite-preview',
-          contents: {
-            parts: [{ inlineData: { mimeType: 'image/jpeg', data: chunkBase64 } }, { text: chunkPrompt }]
-          }
-        });
-        textResponse = response.text || "";
-      }
-
-      // Parse Markdown Table
-      const items: Partial<InvoiceItem>[] = [];
-      const lines = textResponse.split('\n');
-      let inTable = false;
-      
-      for (const line of lines) {
-        if (line.includes('|') && line.includes('---')) {
-          inTable = true;
-          continue;
-        }
-        if (!inTable && line.includes('|') && (line.toLowerCase().includes('description') || line.toLowerCase().includes('quantity'))) {
-           // Header row, skip but mark start
-           continue;
-        }
-        
-        if (line.trim().startsWith('|')) {
-          const cols = line.split('|').map(c => c.trim()).filter(c => c !== '');
-          if (cols.length >= 3) {
-            const raw_name = cols[0];
-            const raw_quantity = parseFloat(cols[1].replace(/[^0-9.]/g, '')) || 1;
-            const raw_price = parseFloat(cols[2].replace(/[^0-9.]/g, '')) || 0;
-            
-            // Basic validation to skip header/separator lines if they slipped through
-            if (!raw_name.includes('---') && raw_name.toLowerCase() !== 'description') {
-               items.push({ raw_name, raw_quantity, raw_price });
-            }
-          }
-        }
-      }
-      return items;
+      });
+      return parseMarkdownTable(response.text || "");
     });
   });
 
@@ -401,8 +397,8 @@ const mapItemsWithRAG = async (
 
   // B. Synthesis Step: Ask LLM to pick the best one
   // BATCHING: Split items into chunks to avoid output token limits and JSON truncation
-  // OPTIMIZATION: Increased chunk size for speed (gpt-4o-mini handles larger context well)
-  const CHUNK_SIZE = config.provider === 'openai' ? 40 : 100;
+  // OPTIMIZATION: Increased chunk size for speed (gpt-5-mini handles larger context well)
+  const CHUNK_SIZE = 100;
   const chunkedItems = [];
   for (let i = 0; i < itemsWithCandidates.length; i += CHUNK_SIZE) {
     chunkedItems.push(itemsWithCandidates.slice(i, i + CHUNK_SIZE));
@@ -483,7 +479,7 @@ const mapItemsWithRAG = async (
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
           body: JSON.stringify({
-              model: "gpt-4o", // High reasoning power
+              model: "gpt-5-mini", // High reasoning power
               messages: [{ role: "system", content: "Return strictly JSON object." }, { role: "user", content: prompt }],
               response_format: { type: "json_object" }
           })
