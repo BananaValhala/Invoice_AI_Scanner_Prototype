@@ -146,7 +146,7 @@ export const generateEmbeddingsForDatabase = async (
     const batch = updatedProducts.slice(i, i + BATCH_SIZE);
     
     // Identify items needing embeddings
-    const itemsToEmbed = batch.filter(p => !p.embedding || p.embedding.length === 0);
+    const itemsToEmbed = batch.filter(p => !p.embedding || p.embedding.length === 0 || p.embeddingProvider !== config.provider);
     
     if (itemsToEmbed.length > 0) {
         const textsToEmbed = itemsToEmbed.map(product => {
@@ -165,7 +165,14 @@ export const generateEmbeddingsForDatabase = async (
 
             // Assign embeddings back to products
             itemsToEmbed.forEach((product, idx) => {
-                product.embedding = embeddings[idx];
+                const indexInUpdated = updatedProducts.findIndex(p => p.id === product.id);
+                if (indexInUpdated !== -1) {
+                    updatedProducts[indexInUpdated] = {
+                        ...product,
+                        embedding: embeddings[idx],
+                        embeddingProvider: config.provider
+                    };
+                }
             });
         } catch (e) {
             console.error(`Failed to embed batch starting at ${i}`, e);
@@ -389,7 +396,7 @@ const mapItemsWithRAG = async (
 
     // Vector Search
     const candidates = embedding.length > 0 
-        ? findNearestNeighbors(embedding, database, 5) // Top 5
+        ? findNearestNeighbors(embedding, database, config.provider, 5) // Top 5
         : []; 
         
     return { ...item, candidates };

@@ -236,13 +236,6 @@ export const saveAppState = async (database: Product[], aiConfig: { provider: st
     const tx = db.transaction(STATE_STORE, 'readwrite');
     tx.objectStore(STATE_STORE).put(state);
     
-    // Return cleanup function to abort transaction if needed
-    const cleanup = () => {
-      if (tx.mode === 'readwrite') {
-        tx.abort();
-      }
-    };
-    
     await new Promise<void>((resolve, reject) => {
       tx.oncomplete = () => {
         console.log('App state saved to IndexedDB');
@@ -254,7 +247,6 @@ export const saveAppState = async (database: Product[], aiConfig: { provider: st
       };
     });
     
-    cleanup(); // Execute cleanup instead of returning it
     return; // Explicitly return void
   } catch (error) {
     console.error('Failed to save app state:', error);
@@ -308,12 +300,13 @@ export const clearAppState = async (): Promise<void> => {
 export const findNearestNeighbors = (
   queryEmbedding: number[],
   database: Product[],
+  provider: string,
   k: number = 5
 ): Product[] => {
-  if (!database.some(p => p.embedding)) return [];
+  if (!database.some(p => p.embedding && p.embeddingProvider === provider)) return [];
   
   return database
-    .filter(p => p.embedding)
+    .filter(p => p.embedding && p.embeddingProvider === provider)
     .map(p => ({
       item: p,
       similarity: cosineSimilarity(queryEmbedding, p.embedding!)

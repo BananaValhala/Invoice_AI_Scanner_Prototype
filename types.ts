@@ -5,6 +5,7 @@ export interface Product {
   unit: string;
   category?: string;
   embedding?: number[];
+  embeddingProvider?: AIProvider;
   metadata?: Record<string, string>;
 }
 

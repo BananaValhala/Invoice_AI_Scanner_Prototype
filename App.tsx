@@ -38,7 +38,16 @@ export default function App() {
       if (savedState) {
         // Restore database (with embeddings)
         if (savedState.database && savedState.database.length > 0) {
-          setDatabase(savedState.database);
+          // Migrate older state that didn't have embeddingProvider
+          const migratedDatabase = savedState.database.map(p => {
+            if (p.embedding && p.embedding.length > 0 && !p.embeddingProvider) {
+              // Infer provider from embedding length (OpenAI text-embedding-3-small is 1536, Gemini is 768)
+              const provider = p.embedding.length === 1536 ? 'openai' : 'gemini';
+              return { ...p, embeddingProvider: provider as 'gemini' | 'openai' };
+            }
+            return p;
+          });
+          setDatabase(migratedDatabase);
           console.log(`Restored database with ${savedState.database.length} products`);
         }
         // Restore AI config (only provider, not API key for security)
@@ -107,24 +116,24 @@ export default function App() {
         const nameMap = new Map();
         
         database.forEach(p => {
-            if (p.id) existingMap.set(p.id, p.embedding);
-            if (p.name) nameMap.set(p.name, p.embedding);
+            if (p.id) existingMap.set(p.id, { embedding: p.embedding, provider: p.embeddingProvider });
+            if (p.name) nameMap.set(p.name, { embedding: p.embedding, provider: p.embeddingProvider });
         });
 
         let preservedCount = 0;
         
         const mergedData = parsedData.map(newItem => {
             // Priority 1: Match by ID (most reliable)
-            let existingEmbedding = newItem.id ? existingMap.get(newItem.id) : undefined;
+            let existingData = newItem.id ? existingMap.get(newItem.id) : undefined;
             
             // Priority 2: Match by Name (fallback)
-            if (!existingEmbedding && newItem.name) {
-                existingEmbedding = nameMap.get(newItem.name);
+            if (!existingData && newItem.name) {
+                existingData = nameMap.get(newItem.name);
             }
             
-            if (existingEmbedding && existingEmbedding.length > 0) {
+            if (existingData && existingData.embedding && existingData.embedding.length > 0) {
                 preservedCount++;
-                return { ...newItem, embedding: existingEmbedding };
+                return { ...newItem, embedding: existingData.embedding, embeddingProvider: existingData.provider };
             }
             
             // If no embedding found, return the new item as-is (it will be indexed later)
@@ -193,10 +202,24 @@ export default function App() {
     try {
       if (!invoice.rawImageBase64) throw new Error("No image data");
       
+      // 1. Check/Index Database
+      let currentDb = database;
+      const needsIndexing = database.some(p => !p.embedding || p.embedding.length === 0 || p.embeddingProvider !== aiConfig.provider);
+      
+      if (needsIndexing) {
+        setIndexingStatus("Initializing database indexing...");
+        currentDb = await generateEmbeddingsForDatabase(database, aiConfig, (current, total) => {
+            const percentage = Math.round((current / total) * 100);
+            setIndexingStatus(`Indexing product database: ${percentage}% (${current}/${total})...`);
+        });
+        setDatabase(currentDb);
+        setIndexingStatus("");
+      }
+
       // Pass feedback to processInvoice
       const extractedItems = await processInvoice(
         invoice.rawImageBase64, 
-        database, 
+        currentDb, 
         aiConfig,
         { incorrectItems }
       );
@@ -213,6 +236,7 @@ export default function App() {
       setInvoices(prev => prev.map(inv => 
         inv.id === invoice.id ? { ...inv, status: 'error', error: e.message } : inv
       ));
+      setIndexingStatus("");
     }
   };
 
@@ -243,8 +267,8 @@ export default function App() {
 
     // 1. Check/Index Database
     let currentDb = database;
-    // Fix: Check if ANY item is missing an embedding, not just the first one.
-    const needsIndexing = database.some(p => !p.embedding || p.embedding.length === 0);
+    // Fix: Check if ANY item is missing an embedding, or if the embedding is from a different provider
+    const needsIndexing = database.some(p => !p.embedding || p.embedding.length === 0 || p.embeddingProvider !== aiConfig.provider);
     
     if (needsIndexing) {
       setIndexingStatus("Initializing database indexing...");
