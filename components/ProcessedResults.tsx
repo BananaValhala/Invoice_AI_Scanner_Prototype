@@ -14,6 +14,11 @@ export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, dat
 
   if (invoice.status === 'pending') return null;
 
+  // For restored invoices, show items but disable image preview and retry
+  const isRestored = invoice.status === 'restored';
+  // Show items for completed or restored invoices
+  const showItems = invoice.status === 'completed' || invoice.status === 'restored';
+
   const getProduct = (id: string | null) => database.find(p => p.id === id);
   
   const images = Array.isArray(invoice.rawImageBase64) 
@@ -50,7 +55,7 @@ export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, dat
                 {(invoice.processTimeMs / 1000).toFixed(2)}s
               </span>
             )}
-            {images.length > 0 && (
+            {images.length > 0 && !isRestored && (
                 <button 
                     onClick={() => setShowPreview(!showPreview)}
                     className="flex items-center gap-1 text-xs font-medium text-indigo-600 hover:text-indigo-700 bg-indigo-50 hover:bg-indigo-100 px-2 py-1 rounded transition-colors"
@@ -60,13 +65,24 @@ export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, dat
                     {showPreview ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
                 </button>
             )}
-            {(invoice.status === 'completed' || invoice.status === 'error') && (
+            {isRestored && (
+                <span className="text-xs bg-amber-100 text-amber-700 px-2 py-1 rounded-full">
+                    Restored
+                </span>
+            )}
+            {(invoice.status === 'completed' || invoice.status === 'restored') && (
                 <button 
                     onClick={handleRetry}
-                    className="flex items-center gap-1 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-700 px-3 py-1.5 rounded transition-colors shadow-sm"
+                    disabled={isRestored}
+                    className={`flex items-center gap-1 text-xs font-medium text-white px-3 py-1.5 rounded transition-colors shadow-sm ${
+                        isRestored 
+                            ? 'bg-slate-400 cursor-not-allowed' 
+                            : 'bg-indigo-600 hover:bg-indigo-700'
+                    }`}
+                    title={isRestored ? 'Re-upload invoice image to retry' : 'Retry processing this invoice'}
                 >
                     <RefreshCw size={14} />
-                    Retry Process
+                    {isRestored ? 'Re-upload to Retry' : 'Retry Process'}
                 </button>
             )}
         </div>
@@ -101,17 +117,19 @@ export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, dat
         </div>
       )}
 
-      {invoice.status === 'completed' && (
+      {(showItems) && (
         <div className="overflow-x-auto">
             <table className="w-full text-sm">
             <thead className="bg-slate-50 text-xs uppercase text-slate-500">
                 <tr>
-                <th className="px-4 py-3 text-center w-10" title="Mark as incorrect">
-                    <AlertCircle size={14} className="mx-auto text-slate-400" />
-                </th>
-                <th className="px-4 py-3 text-left w-1/3">Raw Extraction (From Image)</th>
+                {!isRestored && (
+                    <th className="px-4 py-3 text-center w-10" title="Mark as incorrect">
+                        <AlertCircle size={14} className="mx-auto text-slate-400" />
+                    </th>
+                )}
+                <th className="px-4 py-3 text-left">Raw Extraction (From Image)</th>
                 <th className="px-4 py-3 text-center w-8"></th>
-                <th className="px-4 py-3 text-left w-1/3">Mapped DB Product</th>
+                <th className="px-4 py-3 text-left">Mapped DB Product</th>
                 <th className="px-4 py-3 text-right">Qty</th>
                 <th className="px-4 py-3 text-right">Price</th>
                 
@@ -124,15 +142,17 @@ export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, dat
                 
                 return (
                     <tr key={idx} className={`hover:bg-slate-50 transition-colors ${isSelected ? 'bg-red-50/50' : ''}`}>
-                    <td className="px-4 py-3 text-center">
-                        <input 
-                            type="checkbox" 
-                            checked={isSelected}
-                            onChange={() => toggleIncorrect(idx)}
-                            className="rounded border-slate-300 text-red-600 focus:ring-red-500 cursor-pointer"
-                            title="Mark as incorrect for retry"
-                        />
-                    </td>
+                    {!isRestored && (
+                        <td className="px-4 py-3 text-center">
+                            <input 
+                                type="checkbox" 
+                                checked={isSelected}
+                                onChange={() => toggleIncorrect(idx)}
+                                className="rounded border-slate-300 text-red-600 focus:ring-red-500 cursor-pointer"
+                                title="Mark as incorrect for retry"
+                            />
+                        </td>
+                    )}
                     <td className="px-4 py-3">
                         <div className="font-medium text-slate-800">{item.raw_name}</div>
                     </td>

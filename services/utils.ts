@@ -1,4 +1,4 @@
-import { Product } from '../types';
+import { Product, InvoiceItem, ProcessedInvoice } from '../types';
 
 export const parseCSV = (text: string): Product[] => {
   const lines = text.split('\n').filter(line => line.trim() !== '');
@@ -167,6 +167,142 @@ export const cosineSimilarity = (vecA: number[], vecB: number[]): number => {
   const magnitudeA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
   const magnitudeB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
   return dotProduct / (magnitudeA * magnitudeB);
+};
+
+// --- State Persistence (using IndexedDB for all data) ---
+
+const DB_NAME = 'InvoiceAI_DB';
+const DB_VERSION = 3;
+const STATE_STORE = 'appState';
+
+// IndexedDB helpers for storing all app data
+const openIDB = (): Promise<IDBDatabase> => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(STATE_STORE)) {
+        db.createObjectStore(STATE_STORE, { keyPath: 'key' });
+      }
+    };
+  });
+};
+
+export interface SavedState {
+  key: string; // Always 'appState'
+  database: Product[];
+  aiConfig: {
+    provider: string;
+    apiKey: string;
+  };
+  invoices: Array<{
+    id: string;
+    fileName: string;
+    status: string;
+    items: InvoiceItem[];
+    timestamp: string;
+    error?: string;
+    processTimeMs?: number;
+  }>;
+  savedAt: string;
+}
+
+// Save state to IndexedDB (stores everything including database and embeddings)
+export const saveAppState = async (database: Product[], aiConfig: { provider: string; apiKey: string }, invoices: ProcessedInvoice[]): Promise<void> => {
+  try {
+    // Strip rawImageBase64 from invoices
+    const invoicesWithoutImages = invoices.map(inv => {
+      const { rawImageBase64, ...rest } = inv;
+      return rest;
+    });
+
+    // Security: Don't store API key (XSS vulnerability)
+    const state: SavedState = {
+      key: 'appState',
+      database,
+      aiConfig: {
+        provider: aiConfig.provider,
+        apiKey: '' // API key intentionally not stored
+      },
+      invoices: invoicesWithoutImages,
+      savedAt: new Date().toISOString()
+    };
+
+    const db = await openIDB();
+    const tx = db.transaction(STATE_STORE, 'readwrite');
+    tx.objectStore(STATE_STORE).put(state);
+    
+    // Return cleanup function to abort transaction if needed
+    const cleanup = () => {
+      if (tx.mode === 'readwrite') {
+        tx.abort();
+      }
+    };
+    
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => {
+        console.log('App state saved to IndexedDB');
+        resolve();
+      };
+      tx.onerror = () => {
+        console.error('Failed to save app state:', tx.error);
+        reject(tx.error);
+      };
+    });
+    
+    cleanup(); // Execute cleanup instead of returning it
+    return; // Explicitly return void
+  } catch (error) {
+    console.error('Failed to save app state:', error);
+    return;
+  }
+};
+
+// Load state from IndexedDB
+export const loadAppState = async (): Promise<SavedState | null> => {
+  try {
+    const db = await openIDB();
+    const tx = db.transaction(STATE_STORE, 'readonly');
+    const store = tx.objectStore(STATE_STORE);
+    
+    const request = store.get('appState');
+    
+    return new Promise((resolve, reject) => {
+      request.onsuccess = () => {
+        const result = request.result;
+        if (result) {
+          console.log('App state loaded from IndexedDB:', result.savedAt);
+        }
+        resolve(result || null);
+      };
+      request.onerror = () => reject(request.error);
+    });
+  } catch (error) {
+    console.error('Failed to load app state:', error);
+    return null;
+  }
+};
+
+// Clear all app state
+export const clearAppState = async (): Promise<void> => {
+  try {
+    const db = await openIDB();
+    const tx = db.transaction(STATE_STORE, 'readwrite');
+    tx.objectStore(STATE_STORE).delete('appState');
+    
+    await new Promise((resolve, reject) => {
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+    
+    console.log('App state cleared from IndexedDB');
+  } catch (error) {
+    console.error('Failed to clear app state:', error);
+  }
 };
 
 export const findNearestNeighbors = (

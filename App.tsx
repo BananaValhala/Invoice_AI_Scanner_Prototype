@@ -1,6 +1,6 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { Product, ProcessedInvoice, AIConfig, InvoiceItem } from './types';
-import { parseCSV, fileToBase64, preprocessImage, downloadJSON } from './services/utils';
+import { parseCSV, fileToBase64, preprocessImage, downloadJSON, saveAppState, loadAppState } from './services/utils';
 import { processInvoice, generateEmbeddingsForDatabase } from './services/aiService';
 import { Dropzone } from './components/Dropzone';
 import { DatabaseViewer } from './components/DatabaseViewer';
@@ -24,6 +24,72 @@ export default function App() {
   const [indexingStatus, setIndexingStatus] = useState<string>("");
   const [aiConfig, setAiConfig] = useState<AIConfig>({ provider: 'gemini', apiKey: '' });
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [showRestoreMessage, setShowRestoreMessage] = useState(false);
+  const isFirstRender = React.useRef(true);
+
+  // Load saved state on mount
+  useEffect(() => {
+    let dbConnection: IDBDatabase | null = null;
+    
+    const initApp = async () => {
+      // Load everything from IndexedDB (includes database with embeddings + invoices)
+      const savedState = await loadAppState();
+      
+      if (savedState) {
+        // Restore database (with embeddings)
+        if (savedState.database && savedState.database.length > 0) {
+          setDatabase(savedState.database);
+          console.log(`Restored database with ${savedState.database.length} products`);
+        }
+        // Restore AI config (only provider, not API key for security)
+        if (savedState.aiConfig) {
+          setAiConfig(prev => ({
+            ...prev,
+            provider: savedState.aiConfig.provider || prev.provider
+          }));
+        }
+        // Restore invoice metadata (without images)
+        if (savedState.invoices && savedState.invoices.length > 0) {
+          const restoredInvoices: ProcessedInvoice[] = savedState.invoices.map(inv => ({
+            ...inv,
+            status: 'restored' as const, // Mark as restored since images are not available
+            items: inv.items || [],
+            rawImageBase64: undefined
+          }));
+          setInvoices(restoredInvoices);
+          setShowRestoreMessage(true);
+          setTimeout(() => setShowRestoreMessage(false), 5000);
+        }
+      }
+    };
+    
+    initApp();
+    
+    return () => {
+      if (dbConnection) {
+        dbConnection.close();
+      }
+    };
+  }, []);
+
+  // Save state when database, aiConfig, or invoices change (with debounce)
+  // Skip the first render to avoid overwriting saved state with empty defaults
+  useEffect(() => {
+    // Skip first render (initial mount)
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+
+    const timeoutId = setTimeout(() => {
+      // Only save if there's actual data (not initial empty state)
+      const hasData = database.length > 0 || invoices.length > 0;
+      if (hasData) {
+        saveAppState(database, aiConfig, invoices);
+      }
+    }, 1000); // Debounce saves by 1 second
+    return () => clearTimeout(timeoutId);
+  }, [database, aiConfig, invoices]);
 
   // Handle CSV Database Upload
   const handleDatabaseUpload = async (files: File[]) => {
@@ -156,8 +222,6 @@ export default function App() {
     totalCount: number;
   }>({ startTime: null, completedCount: 0, totalCount: 0 });
 
-  // ... (existing code)
-
   // Process Invoices
   const handleProcessInvoices = async () => {
     if (database.length === 0) {
@@ -263,7 +327,11 @@ export default function App() {
         fileName: inv.fileName,
         processedAt: inv.timestamp,
         processTimeMs: inv.processTimeMs,
-        items: inv.items
+        // Remove candidates list completely to reduce clutter
+        items: inv.items.map(item => {
+          const { candidates, ...itemWithoutCandidates } = item;
+          return itemWithoutCandidates;
+        })
       }))
     };
     downloadJSON(exportData, `invoice_export_${Date.now()}.json`);
@@ -324,9 +392,16 @@ export default function App() {
         </div>
       </header>
 
+      {/* Restore Message */}
+      {showRestoreMessage && (
+        <div className="bg-emerald-500 text-white text-xs py-2 px-4 text-center">
+          Previous session restored
+        </div>
+      )}
+
       {/* Main Content */}
       <main className="flex-1 max-w-7xl mx-auto w-full p-6 lg:p-8">
-        
+         
         {indexingStatus && (
           <div className="mb-6 p-4 bg-indigo-50 border border-indigo-100 rounded-xl flex items-center gap-3">
             <RefreshCw size={20} className="text-indigo-600 animate-spin shrink-0" />
@@ -428,18 +503,18 @@ export default function App() {
                           </span>
                         )}
                         <span className={`
-                            text-xs px-2 py-0.5 rounded-full font-medium uppercase tracking-wide
-                            ${inv.status === 'completed' ? 'bg-emerald-100 text-emerald-700' : ''}
-                            ${inv.status === 'processing' ? 'bg-indigo-100 text-indigo-700' : ''}
-                            ${inv.status === 'pending' ? 'bg-slate-200 text-slate-600' : ''}
-                            ${inv.status === 'error' ? 'bg-red-100 text-red-700' : ''}
+                          text-[10px] font-medium px-1.5 py-0.5 rounded-full shrink-0
+                          ${inv.status === 'pending' ? 'bg-slate-200 text-slate-600' : ''}
+                          ${inv.status === 'processing' ? 'bg-indigo-100 text-indigo-700' : ''}
+                          ${inv.status === 'completed' ? 'bg-emerald-100 text-emerald-700' : ''}
+                          ${inv.status === 'error' ? 'bg-red-100 text-red-700' : ''}
+                          ${inv.status === 'restored' ? 'bg-amber-100 text-amber-700' : ''}
                         `}>
-                            {inv.status}
+                          {inv.status}
                         </span>
                         <button 
                           onClick={() => removeInvoice(inv.id)}
-                          className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
-                          title="Remove image"
+                          className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-500 transition-all"
                         >
                           <Trash2 size={14} />
                         </button>
@@ -451,44 +526,29 @@ export default function App() {
           </div>
 
           {/* Right Panel: Results */}
-          <div className="lg:col-span-8 flex flex-col h-full">
-            <h2 className="text-lg font-semibold text-slate-800 mb-4 flex items-center gap-2">
-               <Zap className="text-indigo-500" size={20} />
-               3. Extracted Data
-            </h2>
-            
-            <div className="flex-1 space-y-6">
-              {invoices.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center bg-slate-50 border-2 border-dashed border-slate-200 rounded-2xl p-12 text-center">
-                  <div className="bg-white p-4 rounded-full shadow-sm mb-4">
-                    <Bot size={32} className="text-slate-300" />
-                  </div>
-                  <h3 className="text-lg font-medium text-slate-900">Ready to Process</h3>
-                  <p className="text-slate-500 max-w-sm mt-2">
-                    Upload your product database CSV and invoice images to begin the AI extraction and mapping process.
-                  </p>
-                </div>
-              ) : (
-                invoices
-                  .filter(inv => inv.status !== 'pending')
-                  .map(inv => (
-                    <div key={inv.id} className="relative group">
-                       <ProcessedResults 
-                          invoice={inv} 
-                          database={database} 
-                          onRetry={handleRetryInvoice}
-                       />
-                    </div>
-                ))
-              )}
-              
-              {invoices.length > 0 && invoices.every(i => i.status === 'pending') && (
-                <div className="p-8 text-center bg-indigo-50 border border-indigo-100 rounded-xl">
-                   <p className="text-indigo-800 font-medium">Invoices queued.</p>
-                   <p className="text-indigo-600 text-sm mt-1">Click "Process Batch" in the top right to start.</p>
-                </div>
-              )}
-            </div>
+          <div className="lg:col-span-8 space-y-6">
+            {/* Process Results */}
+            {invoices.length > 0 && (
+              <div className="space-y-4">
+                {invoices.map(invoice => (
+                  <ProcessedResults 
+                    key={invoice.id} 
+                    invoice={invoice} 
+                    database={database}
+                    onRetry={handleRetryInvoice}
+                  />
+                ))}
+              </div>
+            )}
+
+            {/* Empty State */}
+            {invoices.length === 0 && (
+              <div className="flex flex-col items-center justify-center h-64 text-slate-400 border-2 border-dashed border-slate-200 rounded-xl">
+                <Upload size={48} className="mb-4 text-slate-300" />
+                <p className="text-lg font-medium text-slate-500">No invoices uploaded yet</p>
+                <p className="text-sm">Upload invoice images to get started</p>
+              </div>
+            )}
           </div>
         </div>
       </main>

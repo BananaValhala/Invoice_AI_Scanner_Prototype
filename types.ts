@@ -20,7 +20,7 @@ export interface InvoiceItem {
 export interface ProcessedInvoice {
   id: string;
   fileName: string;
-  status: 'pending' | 'processing' | 'completed' | 'error';
+  status: 'pending' | 'processing' | 'completed' | 'error' | 'restored';
   items: InvoiceItem[];
   timestamp: string;
   rawImageBase64?: string | string[];
