@@ -4,8 +4,7 @@ export interface Product {
   localName: string;
   unit: string;
   category?: string;
-  embedding?: number[];
-  embeddingProvider?: AIProvider;
+  embeddings?: Record<string, number[]>;
   metadata?: Record<string, string>;
 }
 

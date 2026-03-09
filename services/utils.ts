@@ -303,13 +303,13 @@ export const findNearestNeighbors = (
   provider: string,
   k: number = 5
 ): Product[] => {
-  if (!database.some(p => p.embedding && p.embeddingProvider === provider)) return [];
+  if (!database.some(p => p.embeddings && p.embeddings[provider])) return [];
   
   return database
-    .filter(p => p.embedding && p.embeddingProvider === provider)
+    .filter(p => p.embeddings && p.embeddings[provider])
     .map(p => ({
       item: p,
-      similarity: cosineSimilarity(queryEmbedding, p.embedding!)
+      similarity: cosineSimilarity(queryEmbedding, p.embeddings![provider])
     }))
     .sort((a, b) => b.similarity - a.similarity)
     .slice(0, k)

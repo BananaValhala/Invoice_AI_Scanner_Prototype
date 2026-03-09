@@ -146,7 +146,7 @@ export const generateEmbeddingsForDatabase = async (
     const batch = updatedProducts.slice(i, i + BATCH_SIZE);
     
     // Identify items needing embeddings
-    const itemsToEmbed = batch.filter(p => !p.embedding || p.embedding.length === 0 || p.embeddingProvider !== config.provider);
+    const itemsToEmbed = batch.filter(p => !p.embeddings || !p.embeddings[config.provider] || p.embeddings[config.provider].length === 0);
     
     if (itemsToEmbed.length > 0) {
         const textsToEmbed = itemsToEmbed.map(product => {
@@ -169,8 +169,10 @@ export const generateEmbeddingsForDatabase = async (
                 if (indexInUpdated !== -1) {
                     updatedProducts[indexInUpdated] = {
                         ...product,
-                        embedding: embeddings[idx],
-                        embeddingProvider: config.provider
+                        embeddings: {
+                            ...(product.embeddings || {}),
+                            [config.provider]: embeddings[idx]
+                        }
                     };
                 }
             });
