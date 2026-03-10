@@ -31,6 +31,7 @@ export interface ProcessedInvoice {
   rawImageBase64?: string | string[];
   error?: string;
   processTimeMs?: number;
+  aiProvider?: AIProvider;
 }
 
 export type AIProvider = 'gemini' | 'openai' | 'claude';

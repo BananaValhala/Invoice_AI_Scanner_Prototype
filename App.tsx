@@ -229,18 +229,22 @@ export default function App() {
       }
 
       // Pass feedback to processInvoice
+      const processStartTime = Date.now();
       const extractedItems = await processInvoice(
         invoice.rawImageBase64, 
         currentDb, 
         aiConfig,
         { incorrectItems }
       );
+      const processTimeMs = Date.now() - processStartTime;
       
       setInvoices(prev => prev.map(inv => 
         inv.id === invoice.id ? { 
           ...inv, 
           status: 'completed', 
-          items: extractedItems 
+          items: extractedItems,
+          processTimeMs,
+          aiProvider: aiConfig.provider
         } : inv
       ));
     } catch (e: any) {
@@ -334,7 +338,8 @@ export default function App() {
                     ...inv, 
                     status: 'completed', 
                     items: extractedItems,
-                    processTimeMs
+                    processTimeMs,
+                    aiProvider: aiConfig.provider
                   } : inv
                 ));
               } catch (e: any) {
@@ -361,12 +366,13 @@ export default function App() {
         exportedAt: new Date().toISOString(),
         totalInvoices: invoices.length,
         databaseSize: database.length,
-        provider: aiConfig.provider
+        // Removed global provider since each invoice tracks its own
       },
       invoices: invoices.map(inv => ({
         fileName: inv.fileName,
         processedAt: inv.timestamp,
         processTimeMs: inv.processTimeMs,
+        aiProvider: inv.aiProvider || aiConfig.provider, // Fallback for older invoices
         // Remove candidates list completely to reduce clutter
         items: inv.items.map(item => {
           const { candidates, ...itemWithoutCandidates } = item;
@@ -537,6 +543,11 @@ export default function App() {
                         <span className="truncate text-slate-700 font-medium" title={inv.fileName}>{inv.fileName}</span>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
+                        {inv.aiProvider && (
+                          <span className="text-[10px] text-slate-500 bg-slate-200 px-1.5 py-0.5 rounded-full capitalize">
+                            {inv.aiProvider}
+                          </span>
+                        )}
                         {inv.processTimeMs !== undefined && (
                           <span className="text-xs text-slate-500 font-mono">
                             {(inv.processTimeMs / 1000).toFixed(1)}s
