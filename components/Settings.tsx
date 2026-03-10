@@ -34,8 +34,8 @@ export const Settings: React.FC<SettingsProps> = ({ config, onConfigChange, isOp
           <div className="space-y-4">
             <div>
               <label className="block text-xs font-medium text-slate-500 mb-1">Model Provider</label>
-              <div className="grid grid-cols-2 gap-2">
-                {(['gemini', 'openai'] as AIProvider[]).map((p) => (
+              <div className="grid grid-cols-3 gap-2">
+                {(['gemini', 'openai', 'claude'] as AIProvider[]).map((p) => (
                   <button
                     key={p}
                     onClick={() => handleChange('provider', p)}
@@ -69,8 +69,10 @@ export const Settings: React.FC<SettingsProps> = ({ config, onConfigChange, isOp
                 <Key size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
               </div>
               <p className="text-[10px] text-slate-400 mt-1">
-                {config.provider === 'gemini' 
+                {config.provider === 'gemini'
                   ? "Uses default preview key if left empty."
+                  : config.provider === 'claude'
+                  ? "Uses Gemini for embeddings, Claude for OCR & re-ranking."
                   : "Your key is used locally and never stored."}
               </p>
             </div>

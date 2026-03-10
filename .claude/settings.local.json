@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git remote set-url origin https://github.com/integrity-tech-solutions/prototype-ocr-to-item-lines)"
+    ]
+  }
+}

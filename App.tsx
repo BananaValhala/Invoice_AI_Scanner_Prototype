@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { Product, ProcessedInvoice, AIConfig, InvoiceItem } from './types';
-import { parseCSV, fileToBase64, preprocessImage, downloadJSON, saveAppState, loadAppState } from './services/utils';
+import { parseCSV, parseJSON, fileToBase64, preprocessImage, downloadJSON, saveAppState, loadAppState } from './services/utils';
 import { processInvoice, generateEmbeddingsForDatabase } from './services/aiService';
 import { Dropzone } from './components/Dropzone';
 import { DatabaseViewer } from './components/DatabaseViewer';
@@ -38,19 +38,20 @@ export default function App() {
       if (savedState) {
         // Restore database (with embeddings)
         if (savedState.database && savedState.database.length > 0) {
-          // Migrate older state to the new embeddings dictionary structure
-          const migratedDatabase = savedState.database.map((p: any) => {
-            const newProduct = { ...p };
-            if (!newProduct.embeddings) {
-              newProduct.embeddings = {};
+          // Migrate older state to use embeddings dictionary
+          const migratedDatabase = savedState.database.map(p => {
+            const newP = { ...p };
+            if (!newP.embeddings) {
+              newP.embeddings = {};
             }
-            if (p.embedding && p.embedding.length > 0) {
-              const provider = p.embeddingProvider || (p.embedding.length === 1536 ? 'openai' : 'gemini');
-              newProduct.embeddings[provider] = p.embedding;
+            // Handle legacy single embedding format
+            if ((newP as any).embedding && (newP as any).embedding.length > 0) {
+              const provider = (newP as any).embeddingProvider || ((newP as any).embedding.length === 1536 ? 'openai' : 'gemini');
+              newP.embeddings[provider] = (newP as any).embedding;
+              delete (newP as any).embedding;
+              delete (newP as any).embeddingProvider;
             }
-            delete newProduct.embedding;
-            delete newProduct.embeddingProvider;
-            return newProduct as Product;
+            return newP;
           });
           setDatabase(migratedDatabase);
           console.log(`Restored database with ${savedState.database.length} products`);
@@ -105,12 +106,13 @@ export default function App() {
     return () => clearTimeout(timeoutId);
   }, [database, aiConfig, invoices]);
 
-  // Handle CSV Database Upload
+  // Handle Database Upload (CSV or JSON)
   const handleDatabaseUpload = async (files: File[]) => {
     if (files.length === 0) return;
     const file = files[0];
     const text = await file.text();
-    const parsedData = parseCSV(text);
+    const isJSON = file.name.toLowerCase().endsWith('.json');
+    const parsedData = isJSON ? parseJSON(text) : parseCSV(text);
     
     // Smart Merge: Preserve existing embeddings if IDs/Names match
     // This prevents re-indexing the entire database when just adding new items
@@ -121,28 +123,28 @@ export default function App() {
         const nameMap = new Map();
         
         database.forEach(p => {
-            if (p.id) existingMap.set(p.id, p.embeddings);
-            if (p.name) nameMap.set(p.name, p.embeddings);
+            if (p.id) existingMap.set(p.id, { embeddings: p.embeddings });
+            if (p.name) nameMap.set(p.name, { embeddings: p.embeddings });
         });
 
         let preservedCount = 0;
         
         const mergedData = parsedData.map(newItem => {
             // Priority 1: Match by ID (most reliable)
-            let existingEmbeddings = newItem.id ? existingMap.get(newItem.id) : undefined;
+            let existingData = newItem.id ? existingMap.get(newItem.id) : undefined;
             
             // Priority 2: Match by Name (fallback)
-            if (!existingEmbeddings && newItem.name) {
-                existingEmbeddings = nameMap.get(newItem.name);
+            if (!existingData && newItem.name) {
+                existingData = nameMap.get(newItem.name);
             }
             
-            if (existingEmbeddings && Object.keys(existingEmbeddings).length > 0) {
+            if (existingData && existingData.embeddings && Object.keys(existingData.embeddings).length > 0) {
                 preservedCount++;
-                return { ...newItem, embeddings: existingEmbeddings };
+                return { ...newItem, embeddings: existingData.embeddings };
             }
             
             // If no embedding found, return the new item as-is (it will be indexed later)
-            return newItem;
+            return { ...newItem, embeddings: {} };
         });
         
         setDatabase(mergedData);
@@ -189,9 +191,10 @@ export default function App() {
       return;
     }
 
-    const hasApiKey = aiConfig.apiKey || 
+    const hasApiKey = aiConfig.apiKey ||
       (aiConfig.provider === 'gemini' && process.env.GEMINI_API_KEY) ||
-      (aiConfig.provider === 'openai' && process.env.OPENAI_API_KEY);
+      (aiConfig.provider === 'openai' && process.env.OPENAI_API_KEY) ||
+      (aiConfig.provider === 'claude' && process.env.CLAUDE_API_KEY);
 
     if (!hasApiKey) {
       alert(`Please enter an API Key for ${aiConfig.provider} in Settings.`);
@@ -207,13 +210,17 @@ export default function App() {
     try {
       if (!invoice.rawImageBase64) throw new Error("No image data");
       
-      // 1. Check/Index Database
+      // 1. Check/Index Database (Claude uses Gemini for indexing)
       let currentDb = database;
-      const needsIndexing = database.some(p => !p.embeddings || !p.embeddings[aiConfig.provider] || p.embeddings[aiConfig.provider].length === 0);
-      
+      const indexingProvider = aiConfig.provider === 'claude' ? 'gemini' : aiConfig.provider;
+      const indexingConfig = aiConfig.provider === 'claude'
+        ? { provider: 'gemini' as const, apiKey: '' }
+        : aiConfig;
+      const needsIndexing = database.some(p => !p.embeddings || !p.embeddings[indexingProvider] || p.embeddings[indexingProvider].length === 0);
+
       if (needsIndexing) {
         setIndexingStatus("Initializing database indexing...");
-        currentDb = await generateEmbeddingsForDatabase(database, aiConfig, (current, total) => {
+        currentDb = await generateEmbeddingsForDatabase(database, indexingConfig, (current, total) => {
             const percentage = Math.round((current / total) * 100);
             setIndexingStatus(`Indexing product database: ${percentage}% (${current}/${total})...`);
         });
@@ -258,9 +265,10 @@ export default function App() {
       return;
     }
     
-    const hasApiKey = aiConfig.apiKey || 
+    const hasApiKey = aiConfig.apiKey ||
       (aiConfig.provider === 'gemini' && process.env.GEMINI_API_KEY) ||
-      (aiConfig.provider === 'openai' && process.env.OPENAI_API_KEY);
+      (aiConfig.provider === 'openai' && process.env.OPENAI_API_KEY) ||
+      (aiConfig.provider === 'claude' && process.env.CLAUDE_API_KEY);
 
     if (!hasApiKey) {
       alert(`Please enter an API Key for ${aiConfig.provider} in Settings.`);
@@ -270,15 +278,18 @@ export default function App() {
     
     setIsProcessing(true);
 
-    // 1. Check/Index Database
+    // 1. Check/Index Database (Claude uses Gemini for indexing)
     let currentDb = database;
-    // Fix: Check if ANY item is missing an embedding for the current provider
-    const needsIndexing = database.some(p => !p.embeddings || !p.embeddings[aiConfig.provider] || p.embeddings[aiConfig.provider].length === 0);
-    
+    const indexingProvider = aiConfig.provider === 'claude' ? 'gemini' : aiConfig.provider;
+    const indexingConfig = aiConfig.provider === 'claude'
+      ? { provider: 'gemini' as const, apiKey: '' }
+      : aiConfig;
+    const needsIndexing = database.some(p => !p.embeddings || !p.embeddings[indexingProvider] || p.embeddings[indexingProvider].length === 0);
+
     if (needsIndexing) {
       setIndexingStatus("Initializing database indexing...");
       try {
-        currentDb = await generateEmbeddingsForDatabase(database, aiConfig, (current, total) => {
+        currentDb = await generateEmbeddingsForDatabase(database, indexingConfig, (current, total) => {
             const percentage = Math.round((current / total) * 100);
             setIndexingStatus(`Indexing product database: ${percentage}% (${current}/${total})...`);
         });
@@ -487,10 +498,10 @@ export default function App() {
                 1. Reference Dataset
               </h2>
               <div className="space-y-4">
-                <Dropzone 
+                <Dropzone
                   onFileSelect={handleDatabaseUpload}
-                  accept=".csv"
-                  label="Upload Product Table (CSV)"
+                  accept=".csv,.json"
+                  label="Upload Product Table (CSV / JSON)"
                   icon={<FileText size={24} />}
                 />
                 <div className="h-64">

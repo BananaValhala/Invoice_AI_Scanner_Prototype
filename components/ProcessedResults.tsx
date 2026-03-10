@@ -10,6 +10,7 @@ interface ProcessedResultsProps {
 
 export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, database, onRetry }) => {
   const [showPreview, setShowPreview] = useState(false);
+  const [isRolledUp, setIsRolledUp] = useState(false);
   const [selectedIncorrectIndices, setSelectedIncorrectIndices] = useState<Set<number>>(new Set());
 
   if (invoice.status === 'pending') return null;
@@ -85,6 +86,16 @@ export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, dat
                     {isRestored ? 'Re-upload to Retry' : 'Retry Process'}
                 </button>
             )}
+            {(invoice.status === 'completed' || invoice.status === 'restored') && (
+                <button 
+                    onClick={() => setIsRolledUp(!isRolledUp)}
+                    className="flex items-center gap-1 text-xs font-medium text-slate-600 hover:text-slate-700 bg-slate-100 hover:bg-slate-200 px-2 py-1.5 rounded transition-colors"
+                    title={isRolledUp ? 'Expand results' : 'Collapse results'}
+                >
+                    {isRolledUp ? 'Expand' : 'Collapse'}
+                    {isRolledUp ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+                </button>
+            )}
         </div>
       </div>
 
@@ -111,13 +122,24 @@ export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, dat
       )}
 
       {invoice.status === 'error' && (
-        <div className="p-6 bg-red-50 text-red-700 flex items-center gap-3">
+        <div className="p-6 bg-red-50 text-red-700 flex flex-col gap-2">
+          <div className="flex items-center gap-3">
             <AlertCircle />
-            <p>Failed to process this invoice. Please try again.</p>
+            <p className="font-medium">Failed to process this invoice.</p>
+          </div>
+          {invoice.error && (
+            <pre className="text-xs bg-red-100 rounded p-3 overflow-x-auto whitespace-pre-wrap break-all">{invoice.error}</pre>
+          )}
         </div>
       )}
 
-      {(showItems) && (
+      {(showItems && isRolledUp) && (
+        <div className="p-4 text-sm text-slate-500 bg-slate-50 border-t border-slate-100 flex justify-between">
+            <span>{invoice.items.length} items extracted.</span>
+            <span>{invoice.items.filter(i => i.match_status === 'matched').length} matched.</span>
+        </div>
+      )}
+      {(showItems && !isRolledUp) && (
         <div className="overflow-x-auto">
             <table className="w-full text-sm">
             <thead className="bg-slate-50 text-xs uppercase text-slate-500">
@@ -162,13 +184,27 @@ export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, dat
                     <td className="px-4 py-3">
                         {matchedProduct ? (
                         <div className="flex items-start gap-2">
-                            <CheckCircle2 size={16} className="text-emerald-500 mt-0.5 shrink-0" />
+                            <CheckCircle2 size={16} className={`mt-0.5 shrink-0 ${item.match_status === 'matched' ? 'text-emerald-500' : 'text-amber-500'}`} />
                             <div>
                             <div className="font-medium text-slate-800">{matchedProduct.localName}</div>
                             <div className="text-xs text-slate-500">{matchedProduct.name} ({matchedProduct.id})</div>
+                            {item.match_status && (
+                                <span className={`inline-block text-[10px] font-medium px-1.5 py-0.5 rounded mt-1 ${
+                                    item.match_status === 'matched'
+                                        ? 'bg-emerald-100 text-emerald-700'
+                                        : 'bg-amber-100 text-amber-700'
+                                }`}>
+                                    {item.match_status === 'matched' ? 'Matched' : 'Review'}
+                                </span>
+                            )}
                             {item.reasoning && (
                                 <div className="text-[10px] text-slate-400 mt-1 italic border-l-2 border-slate-200 pl-2">
                                     "{item.reasoning}"
+                                </div>
+                            )}
+                            {typeof item.confidence_score === 'number' && (
+                                <div className="text-[10px] text-slate-500 mt-1">
+                                    Confidence: {(item.confidence_score * 100).toFixed(1)}%
                                 </div>
                             )}
                             {item.candidates && item.candidates.length > 0 && (
@@ -178,8 +214,8 @@ export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, dat
                                     </summary>
                                     <div className="pl-2 border-l-2 border-indigo-100 mt-1">
                                         {item.candidates.map(c => (
-                                            <div key={c.id} className="text-[10px] text-slate-500 truncate" title={`${c.name} / ${c.localName}`}>
-                                                • {c.localName} ({c.name})
+                                            <div key={c.id} className="text-[10px] text-slate-500 truncate" title={`${c.id} — ${c.name} / ${c.localName}`}>
+                                                • {c.localName} ({c.name}) <span className="text-slate-400 font-mono">{c.id.slice(0, 8)}</span>{(c as any)._score != null && <span className="text-indigo-400 ml-1">{((c as any)._score * 100).toFixed(0)}%</span>}
                                             </div>
                                         ))}
                                     </div>
@@ -190,12 +226,20 @@ export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, dat
                         ) : (
                         <div className="flex flex-col gap-1 text-slate-400 italic">
                             <div className="flex items-center gap-2">
-                                <AlertCircle size={16} />
+                                <AlertCircle size={16} className="text-red-400" />
                                 <span>No match found</span>
+                                <span className="inline-block text-[10px] font-medium px-1.5 py-0.5 rounded bg-red-100 text-red-700 not-italic">
+                                    No Match
+                                </span>
                             </div>
                             {item.reasoning && (
                                 <div className="text-[10px] text-slate-400 ml-6 border-l-2 border-slate-200 pl-2">
                                     "{item.reasoning}"
+                                </div>
+                            )}
+                            {typeof item.confidence_score === 'number' && (
+                                <div className="text-[10px] text-slate-500 ml-6">
+                                    Confidence: {(item.confidence_score * 100).toFixed(1)}%
                                 </div>
                             )}
                             {item.candidates && item.candidates.length > 0 && (
@@ -205,8 +249,8 @@ export const ProcessedResults: React.FC<ProcessedResultsProps> = ({ invoice, dat
                                     </summary>
                                     <div className="pl-2 border-l-2 border-indigo-100 mt-1">
                                         {item.candidates.map(c => (
-                                            <div key={c.id} className="text-[10px] text-slate-500 truncate" title={`${c.name} / ${c.localName}`}>
-                                                • {c.localName} ({c.name})
+                                            <div key={c.id} className="text-[10px] text-slate-500 truncate" title={`${c.id} — ${c.name} / ${c.localName}`}>
+                                                • {c.localName} ({c.name}) <span className="text-slate-400 font-mono">{c.id.slice(0, 8)}</span>{(c as any)._score != null && <span className="text-indigo-400 ml-1">{((c as any)._score * 100).toFixed(0)}%</span>}
                                             </div>
                                         ))}
                                     </div>

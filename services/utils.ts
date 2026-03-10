@@ -1,56 +1,324 @@
 import { Product, InvoiceItem, ProcessedInvoice } from '../types';
 
+const DELIMITER_CANDIDATES = [',', ';', '\t', '|'] as const;
+
+const stripUtf8Bom = (text: string): string => text.replace(/^\uFEFF/, '');
+
+const parseDelimitedLine = (line: string, delimiter: string): string[] => {
+  const cols: string[] = [];
+  let current = '';
+  let inQuote = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (char === '"') {
+      // Escaped quote inside quoted field: ""
+      if (inQuote && line[i + 1] === '"') {
+        current += '"';
+        i += 1;
+        continue;
+      }
+      inQuote = !inQuote;
+      continue;
+    }
+
+    if (char === delimiter && !inQuote) {
+      cols.push(current.trim());
+      current = '';
+      continue;
+    }
+
+    current += char;
+  }
+
+  cols.push(current.trim());
+  return cols.map(value => value.replace(/^"|"$/g, ''));
+};
+
+const detectDelimiter = (line: string): string => {
+  const scores = DELIMITER_CANDIDATES.map((delimiter) => ({
+    delimiter,
+    score: parseDelimitedLine(line, delimiter).length
+  }));
+
+  return scores.sort((a, b) => b.score - a.score)[0].delimiter;
+};
+
+const parseDelimitedText = (text: string, delimiter: string): string[][] => {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = '';
+  let inQuote = false;
+
+  const flushField = () => {
+    row.push(field.trim().replace(/^"|"$/g, ''));
+    field = '';
+  };
+
+  const flushRow = () => {
+    // Ignore fully empty rows
+    if (row.some(col => col.length > 0)) rows.push(row);
+    row = [];
+  };
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+
+    if (char === '"') {
+      if (inQuote && text[i + 1] === '"') {
+        field += '"';
+        i += 1;
+      } else {
+        inQuote = !inQuote;
+      }
+      continue;
+    }
+
+    if (char === delimiter && !inQuote) {
+      flushField();
+      continue;
+    }
+
+    if ((char === '\n' || char === '\r') && !inQuote) {
+      // Handle CRLF as a single row break.
+      if (char === '\r' && text[i + 1] === '\n') i += 1;
+      flushField();
+      flushRow();
+      continue;
+    }
+
+    field += char;
+  }
+
+  // Flush tail
+  if (field.length > 0 || row.length > 0) {
+    flushField();
+    flushRow();
+  }
+
+  return rows;
+};
+
+const normalizeHeader = (header: string): string =>
+  header
+    .trim()
+    .replace(/^"|"$/g, '')
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+
+const findColumnExactFirst = (
+  headers: string[],
+  exactAliases: string[],
+  fuzzyAliases: string[] = exactAliases,
+  exclude: string[] = []
+): number => {
+  const exactSet = new Set(exactAliases.map(a => a.toLowerCase()));
+  const excludeSet = new Set(exclude.map(e => e.toLowerCase()));
+
+  const exactIndex = headers.findIndex(h => exactSet.has(h));
+  if (exactIndex >= 0) return exactIndex;
+
+  return headers.findIndex(h =>
+    !excludeSet.has(h) && fuzzyAliases.some(alias => h.includes(alias.toLowerCase()))
+  );
+};
+
+const safeParseNameObject = (value: string): Record<string, string> | null => {
+  const text = value?.trim();
+  if (!text || (!text.startsWith('{') && !text.startsWith('['))) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') return null;
+    const normalized: Record<string, string> = {};
+    Object.entries(parsed).forEach(([k, v]) => {
+      if (typeof v === 'string' && v.trim()) normalized[k.toLowerCase()] = v.trim();
+    });
+    return Object.keys(normalized).length > 0 ? normalized : null;
+  } catch {
+    return null;
+  }
+};
+
+const pickBestName = (nameObj: Record<string, string>, fallbacks: string[]): string => {
+  for (const key of fallbacks) {
+    if (nameObj[key]) return nameObj[key];
+  }
+  const first = Object.values(nameObj)[0];
+  return first || 'Unknown';
+};
+
+export const normalizeTextForMatch = (input: string): string => {
+  if (!input) return '';
+
+  // NFKC handles full-width/half-width variants and compatibility forms.
+  let normalized = input.normalize('NFKC');
+
+  // Unify common Japanese and full-width bracket variants.
+  normalized = normalized
+    .replace(/[（［｛【〔〈《]/g, '(')
+    .replace(/[）］｝】〕〉》]/g, ')')
+    .replace(/[「『]/g, '"')
+    .replace(/[」』]/g, '"');
+
+  // Collapse repeated whitespace and normalize spacing around brackets.
+  normalized = normalized
+    .replace(/\s+/g, ' ')
+    .replace(/\s*\(\s*/g, '(')
+    .replace(/\s*\)\s*/g, ') ')
+    .trim();
+
+  return normalized;
+};
+
+const isDeletedValue = (value: string | undefined): boolean => {
+  if (!value) return false;
+  return /^(1|true|yes|y|deleted)$/i.test(value.trim());
+};
+
+const getMetadataValue = (metadata: Record<string, string> | undefined, key: string): string | undefined => {
+  if (!metadata) return undefined;
+  if (metadata[key] !== undefined) return metadata[key];
+
+  const target = key.toLowerCase();
+  const found = Object.entries(metadata).find(([k]) =>
+    k.toLowerCase().replace(/[\s-]+/g, '_') === target
+  );
+  return found?.[1];
+};
+
+export const isDeletedProduct = (product: Product): boolean => {
+  const rawValue =
+    getMetadataValue(product.metadata, 'is_deleted') ??
+    getMetadataValue(product.metadata, 'deleted') ??
+    getMetadataValue(product.metadata, 'isdeleted');
+  return isDeletedValue(rawValue);
+};
+
+const findKey = (obj: Record<string, any>, aliases: string[]): string | undefined => {
+  const keys = Object.keys(obj);
+  const normalized = keys.map(k => k.toLowerCase().replace(/[\s-]+/g, '_'));
+  for (const alias of aliases) {
+    const idx = normalized.indexOf(alias.toLowerCase());
+    if (idx >= 0) return keys[idx];
+  }
+  for (const alias of aliases) {
+    const idx = normalized.findIndex(k => k.includes(alias.toLowerCase()));
+    if (idx >= 0) return keys[idx];
+  }
+  return undefined;
+};
+
+export const parseJSON = (text: string): Product[] => {
+  const parsed = JSON.parse(text);
+  const items: Record<string, any>[] = Array.isArray(parsed) ? parsed : (parsed.data ?? parsed.products ?? parsed.items ?? []);
+  if (!items.length) return [];
+
+  const sample = items[0];
+  const idKey = findKey(sample, ['id', 'code', 'sku']);
+  const nameKey = findKey(sample, ['name', 'product_name', 'product']);
+  const localNameKey = findKey(sample, ['local_name', 'localName', 'alt_name', 'native_name', 'thai_name', 'chinese_name', 'japanese_name', 'ja_name']);
+  const unitKey = findKey(sample, ['unit', 'units', 'uom']);
+  const categoryKey = findKey(sample, ['category', 'group', 'type']);
+  const knownKeys = new Set([idKey, nameKey, localNameKey, unitKey, categoryKey].filter(Boolean));
+
+  return items.map((item, index) => {
+    const rawName = nameKey ? String(item[nameKey] ?? '') : '';
+    const parsedNameObj = typeof item[nameKey!] === 'object' && item[nameKey!] !== null && !Array.isArray(item[nameKey!])
+      ? (Object.fromEntries(Object.entries(item[nameKey!]).filter(([, v]) => typeof v === 'string' && (v as string).trim()).map(([k, v]) => [k.toLowerCase(), (v as string).trim()])) as Record<string, string>)
+      : safeParseNameObject(rawName);
+
+    const primaryName = parsedNameObj
+      ? pickBestName(parsedNameObj, ['en', 'english', 'name', 'ja', 'jp', 'japanese', 'zh', 'th'])
+      : rawName || 'Unknown';
+    const localNameFromObject = parsedNameObj
+      ? pickBestName(parsedNameObj, ['ja', 'jp', 'japanese', 'zh', 'chinese', 'th', 'thai', 'local'])
+      : '';
+    const localNameRaw = localNameKey ? String(item[localNameKey] ?? '') : '';
+
+    const metadata: Record<string, string> = {};
+    Object.entries(item).forEach(([k, v]) => {
+      if (!knownKeys.has(k) && v != null) {
+        metadata[k.toLowerCase().replace(/[\s-]+/g, '_')] = typeof v === 'object' ? JSON.stringify(v) : String(v);
+      }
+    });
+    if (parsedNameObj) metadata.name_json = typeof item[nameKey!] === 'object' ? JSON.stringify(item[nameKey!]) : rawName;
+
+    return {
+      id: idKey ? String(item[idKey] ?? `TEMP-${index}`) : `TEMP-${index}`,
+      name: primaryName || 'Unknown',
+      localName: localNameRaw || localNameFromObject || '',
+      unit: unitKey ? String(item[unitKey] ?? 'pcs') : 'pcs',
+      category: categoryKey ? String(item[categoryKey] ?? 'General') : 'General',
+      metadata,
+    };
+  });
+};
+
 export const parseCSV = (text: string): Product[] => {
-  const lines = text.split('\n').filter(line => line.trim() !== '');
-  if (lines.length < 2) return [];
+  const cleanedText = stripUtf8Bom(text || '').trim();
+  if (!cleanedText) return [];
 
-  // Parse Header
-  const headerLine = lines[0];
-  const headers = headerLine.split(',').map(h => h.trim().replace(/^"|"$/g, '').toLowerCase());
+  const headerLine = cleanedText.split(/\r?\n/).find(line => line.trim() !== '');
+  if (!headerLine) return [];
 
-  // Helper to find column index by name (fuzzy match)
-  const findCol = (keywords: string[]) => headers.findIndex(h => keywords.some(k => h.includes(k)));
+  const delimiter = detectDelimiter(headerLine);
+  const rows = parseDelimitedText(cleanedText, delimiter);
+  if (rows.length < 2) return [];
 
-  const idIdx = findCol(['id', 'code', 'sku']);
-  const nameIdx = findCol(['name', 'product', 'description', 'english']);
-  const localNameIdx = findCol(['local', 'alt', 'native', 'thai', 'chinese']);
-  const unitIdx = findCol(['unit', 'uom']);
-  const categoryIdx = findCol(['category', 'group', 'type']);
+  const headers = rows[0].map(normalizeHeader);
+
+  const idIdx = findColumnExactFirst(headers, ['id', 'code', 'sku'], ['id', 'code', 'sku']);
+  const nameIdx = findColumnExactFirst(
+    headers,
+    ['name', 'product_name', 'product'],
+    ['name', 'product', 'description', 'english'],
+    ['scientific_name']
+  );
+  const localNameIdx = findColumnExactFirst(
+    headers,
+    ['local_name', 'localname', 'alt_name', 'native_name', 'thai_name', 'chinese_name', 'japanese_name', 'ja_name'],
+    ['local', 'alt', 'native', 'thai', 'chinese', 'japanese', 'ja']
+  );
+  const unitIdx = findColumnExactFirst(headers, ['unit', 'units', 'uom'], ['unit', 'uom']);
+  const categoryIdx = findColumnExactFirst(headers, ['category', 'group', 'type'], ['category', 'group', 'type']);
+  const originsIdx = findColumnExactFirst(headers, ['origins', 'origin'], ['origin']);
+  const isDeletedIdx = findColumnExactFirst(headers, ['is_deleted', 'deleted', 'isdeleted'], ['is_deleted', 'deleted']);
 
   // Skip header
-  const data = lines.slice(1).map((line, index) => {
-    // Handle quotes in CSV if necessary, simple split for prototype
-    // Note: A robust CSV parser (like PapaParse) is better for production, 
-    // but for this prototype we'll do a basic split that handles some quotes.
-    const cols: string[] = [];
-    let inQuote = false;
-    let current = '';
-    
-    for (let i = 0; i < line.length; i++) {
-        const char = line[i];
-        if (char === '"') {
-            inQuote = !inQuote;
-        } else if (char === ',' && !inQuote) {
-            cols.push(current.trim().replace(/^"|"$/g, ''));
-            current = '';
-        } else {
-            current += char;
-        }
-    }
-    cols.push(current.trim().replace(/^"|"$/g, ''));
+  const data = rows.slice(1).map((cols, index) => {
+    const rawName = (nameIdx >= 0 ? cols[nameIdx] : cols[1]) || '';
+    const parsedNameObj = safeParseNameObject(rawName);
+    const primaryName = parsedNameObj
+      ? pickBestName(parsedNameObj, ['en', 'english', 'name', 'ja', 'jp', 'japanese', 'zh', 'th'])
+      : rawName || 'Unknown';
+    const localNameFromObject = parsedNameObj
+      ? pickBestName(parsedNameObj, ['ja', 'jp', 'japanese', 'zh', 'chinese', 'th', 'thai', 'local'])
+      : '';
+    const localNameRaw = (localNameIdx >= 0 ? cols[localNameIdx] : cols[2]) || '';
 
     // Capture all other columns as metadata
     const metadata: Record<string, string> = {};
     headers.forEach((h, i) => {
-        if (i !== idIdx && i !== nameIdx && i !== localNameIdx && i !== unitIdx && i !== categoryIdx) {
+        if (
+          i !== idIdx &&
+          i !== nameIdx &&
+          i !== localNameIdx &&
+          i !== unitIdx &&
+          i !== categoryIdx
+        ) {
             if (cols[i]) metadata[h] = cols[i];
         }
     });
+
+    // Keep stable metadata keys for downstream logic.
+    if (originsIdx >= 0 && cols[originsIdx]) metadata.origins = cols[originsIdx];
+    if (isDeletedIdx >= 0 && cols[isDeletedIdx]) metadata.is_deleted = cols[isDeletedIdx];
+    if (parsedNameObj) metadata.name_json = rawName;
     
     return {
       id: (idIdx >= 0 ? cols[idIdx] : cols[0]) || `TEMP-${index}`,
-      name: (nameIdx >= 0 ? cols[nameIdx] : cols[1]) || 'Unknown',
-      localName: (localNameIdx >= 0 ? cols[localNameIdx] : cols[2]) || '',
+      name: primaryName || 'Unknown',
+      localName: localNameRaw || localNameFromObject || '',
       unit: (unitIdx >= 0 ? cols[unitIdx] : cols[3]) || 'pcs',
       category: (categoryIdx >= 0 ? cols[categoryIdx] : cols[4]) || 'General',
       metadata: metadata // Store extra columns here
@@ -303,10 +571,11 @@ export const findNearestNeighbors = (
   provider: string,
   k: number = 5
 ): Product[] => {
-  if (!database.some(p => p.embeddings && p.embeddings[provider])) return [];
+  if (!database.some(p => p.embeddings?.[provider] && !isDeletedProduct(p))) return [];
   
   return database
-    .filter(p => p.embeddings && p.embeddings[provider])
+    // Explicit business rule: never retrieve deleted products.
+    .filter(p => p.embeddings?.[provider] && !isDeletedProduct(p))
     .map(p => ({
       item: p,
       similarity: cosineSimilarity(queryEmbedding, p.embeddings![provider])

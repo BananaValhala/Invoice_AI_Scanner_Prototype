@@ -8,12 +8,17 @@ export interface Product {
   metadata?: Record<string, string>;
 }
 
+export type MatchStatus = 'matched' | 'low_confidence' | 'no_match';
+
 export interface InvoiceItem {
   raw_name: string;
+  core_name?: string;
   raw_price: number;
   raw_quantity: number;
   matched_product_id: string | null;
+  match_status?: MatchStatus;
   reasoning?: string;
+  confidence_score?: number;
   candidates?: Product[];
 }
 
@@ -28,7 +33,7 @@ export interface ProcessedInvoice {
   processTimeMs?: number;
 }
 
-export type AIProvider = 'gemini' | 'openai';
+export type AIProvider = 'gemini' | 'openai' | 'claude';
 
 export interface AIConfig {
   provider: AIProvider;
